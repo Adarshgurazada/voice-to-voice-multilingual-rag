@@ -58,7 +58,7 @@ FAISS_INDEX_SUFFIX = ".faissindex"
 METADATA_SUFFIX = ".meta.parquet"
 
 # --- Session Configuration ---
-DEFAULT_VOICE = "leda"; DEFAULT_LANGUAGE = "hi-IN"
+DEFAULT_VOICE = "Leda"; DEFAULT_LANGUAGE = "hi-IN"
 SUPPORTED_LANGUAGES = ["en-US", "ta-IN", "gu-IN","mr-IN", "te-IN", "bn-IN", "kn-IN", "hi-IN", "ml-IN", "en-GB", "en-IN", ]
 AVAILABLE_VOICES = ["Aoede", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Zephyr"]
 
