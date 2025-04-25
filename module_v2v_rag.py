@@ -58,8 +58,8 @@ FAISS_INDEX_SUFFIX = ".faissindex"
 METADATA_SUFFIX = ".meta.parquet"
 
 # --- Session Configuration ---
-DEFAULT_VOICE = "Aoede"; DEFAULT_LANGUAGE = "hi-IN"
-SUPPORTED_LANGUAGES = ["en-US", "es-US", "fr-FR", "de-DE", "te-IN", "bn-IN", "kn-IN", "hi-IN", "ml-IN"]
+DEFAULT_VOICE = "leda"; DEFAULT_LANGUAGE = "hi-IN"
+SUPPORTED_LANGUAGES = ["en-US", "ta-IN", "gu-IN","mr-IN", "te-IN", "bn-IN", "kn-IN", "hi-IN", "ml-IN", "en-GB", "en-IN", ]
 AVAILABLE_VOICES = ["Aoede", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Zephyr"]
 
 # --- Helper Functions (RAG Logic - FAISS Integrated) ---
@@ -387,7 +387,8 @@ class VoiceRAGMultimodalFAISS: # Renamed class
         if not self.genai_client or self.metadata_db is None or self.faiss_index is None: # Check combined DBs
              print("Error: GenAI Client or RAG DB not ready.", file=sys.stderr); self.is_active = False; return
         print("Status: Configuring Gemini Live client...");
-        system_instruction_text = f"Answer questions based ONLY on provided Context (text & image descriptions). If missing, say so. Respond in {self.language_code}."
+        # system_instruction_text = f"Answer questions based ONLY on provided Context (text & image descriptions). If missing, say so. Respond in {self.language_code}."
+        system_instruction_text = f"Answer any questions asked by the user, if the user tells his glucose is x, assume that he is telling it as x mg/dl. If missing, say so. Respond in {self.language_code}."
         system_instruction = Content(role="system", parts=[Part(text=system_instruction_text)])
         live_api_model_id = "gemini-2.0-flash-live-preview-04-09"
         live_config = LiveConnectConfig(
