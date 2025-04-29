@@ -182,6 +182,7 @@ python module_v2v_rag.py path/to/your/document1.pdf [path/to/another/document2.p
 *   **Caching:** Implement caching for embeddings and potentially image descriptions to speed up reprocessing.
 *   **Containerization:** Package the application using Docker for easier deployment and dependency management.
 *   **Conversation History:** Allow the model to consider previous turns in the conversation for more contextually relevant answers.
+*   **VAD (Voice Activity Detection)**: I Couldn't get the VAD to work on this setup. Maybe it is my incapability but feel free to add VAD to this project for an ever better seemless experience while talking to your documents. 
 
 ## Contributing
 
