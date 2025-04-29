@@ -113,7 +113,11 @@ def build_or_load_index(pdf_path_str: str, genai_client: genai.Client, image_des
     metadata_filename = Path(f"{doc_basename}{METADATA_SUFFIX}")
 
     img_dir_path = Path(image_save_dir); img_dir_path.mkdir(parents=True, exist_ok=True)
-    image_description_prompt = "Describe this image in detail. If it's a table, extract the data. If it's a chart, explain its key findings."
+    image_description_prompt = """
+    Describe this image in detail. If it's a table, extract the data. If it's a chart, explain its key findings. 
+    If its an image with text on it. Try transcribing the text in great detail. 
+    So that it is usefull for the user to understand the test as well. 
+    """
 
     embeddings_list = []
     metadata_list = []
@@ -388,7 +392,11 @@ class VoiceRAGMultimodalFAISS: # Renamed class
              print("Error: GenAI Client or RAG DB not ready.", file=sys.stderr); self.is_active = False; return
         print("Status: Configuring Gemini Live client...");
         # system_instruction_text = f"Answer questions based ONLY on provided Context (text & image descriptions). If missing, say so. Respond in {self.language_code}."
-        system_instruction_text = f"Answer any questions asked by the user, if the user tells his glucose is x, assume that he is telling it as x mg/dl. If missing, say so. Respond in {self.language_code}."
+        system_instruction_text = f""" Answer any questions asked by the user. Answer in a positive tone. 
+        Make the user feel like they are talking to a human. Add pauses and filler words to feel like a natural conversation. 
+        If missing, say so. Respond in {self.language_code}.
+        """
+        
         system_instruction = Content(role="system", parts=[Part(text=system_instruction_text)])
         live_api_model_id = "gemini-2.0-flash-live-preview-04-09"
         live_config = LiveConnectConfig(
