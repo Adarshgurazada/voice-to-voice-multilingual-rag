@@ -1,22 +1,25 @@
 # Voice-to-Voice Multilingual Multimodal RAG
 
-[![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
-This repository contains a Python application demonstrating a real-time, voice-driven Retrieval-Augmented Generation (RAG) system. It allows users to ask questions in voice, have the system retrieve relevant information from provided PDF documents (including text and image content), and receive a spoken answer in the chosen language. The system leverages Google Cloud's AI services, specifically the Gemini Live API, Vertex AI, and Cloud Speech-to-Text, along with FAISS for efficient vector search.
+This repository contains a Python application demonstrating a real-time, voice-driven Retrieval-Augmented Generation (RAG) system. It allows users to ask questions by voice, have the system retrieve relevant information from provided PDF documents (including text and image content), and receive a spoken answer in the chosen language. The system runs entirely on OpenAI services: a single OpenAI Realtime `gpt-realtime-mini` session handles speech-to-text, reasoning, and text-to-speech, while `text-embedding-3-small` embeddings and `gpt-5.4-mini` vision/reranking power the multimodal retrieval, backed by FAISS for fast vector search.
 
 **GitHub Repository:** [https://github.com/Adarshgurazada/voice-to-voice-multilingual-rag.git](https://github.com/Adarshgurazada/voice-to-voice-multilingual-rag.git)
 
 ## Key Features
 
-*   **Real-time Voice Interaction:** Speak your questions naturally via your microphone and hear the answers spoken back.
+*   **Real-time Voice Interaction:** Speak your questions naturally via your microphone and hear the answers spoken back — all through one OpenAI Realtime session that performs speech-to-text, reasoning, and text-to-speech end to end.
 *   **Multimodal RAG:**
     *   Extracts both text and images from PDF documents.
-    *   Generates textual descriptions for images using a vision model (Gemini Flash).
-    *   Creates vector embeddings for both text chunks *and* image descriptions using Google's text embedding models.
-    *   Retrieves the most relevant text snippets *or* image descriptions based on the semantic similarity to your spoken query.
+    *   Generates textual descriptions for images using the `gpt-5.4-mini` vision model.
+    *   Creates vector embeddings for both text chunks *and* image descriptions using OpenAI's `text-embedding-3-small` model (1536-dimensional). This represents both text and image content in the same vector space — the core of the **multimodal** capability.
+    *   Uses improved overlapping, word-boundary chunking so passages stay coherent across chunk borders.
+    *   Retrieves the most relevant text snippets *or* image descriptions based on semantic similarity to your spoken query.
+*   **Over-fetch + Rerank Retrieval:** FAISS over-fetches roughly 20 candidate passages, then `gpt-5.4-mini` reranks them down to the top 5 most relevant results (with a graceful fallback to FAISS order if reranking is unavailable or times out).
+*   **Grounded Answers via Tool Calling:** The Realtime session is given a `search_documents` tool. Each turn the model calls the tool, the app runs FAISS + rerank, and returns grounded context that the model then speaks — so answers stay tied to your documents.
 *   **Multilingual Support:**
-    *   Transcribes user speech and generates spoken responses in multiple languages (e.g., `en-US`, `hi-IN`, `es-US`, `fr-FR`, `de-DE`, `te-IN`, `bn-IN`, `kn-IN`, `ml-IN`).
-    *   Allows selection of different output voices provided by the Gemini Live API.
+    *   Transcribes user speech and generates spoken responses in multiple languages (e.g., `en-US`, `hi-IN`, `ta-IN`, `te-IN`, `bn-IN`, `gu-IN`, `mr-IN`, `kn-IN`, `ml-IN`).
+    *   Choose from a range of OpenAI Realtime output voices.
 *   **Efficient Retrieval:** Utilizes FAISS (Facebook AI Similarity Search) for fast and scalable similarity searches over the document embeddings.
 *   **PDF Processing:** Handles single or multiple PDF documents as the knowledge base.
 *   **Asynchronous Architecture:** Uses Python's `asyncio` for efficient handling of audio I/O, API calls, and processing, enabling a more responsive experience.
@@ -28,77 +31,54 @@ The application follows these steps:
 
 1.  **Initialization & RAG Setup (First Run or New PDFs):**
     *   Takes one or more PDF file paths as input.
-    *   **Checks for Existing Index:** For each PDF, it looks for corresponding `.faissindex` and `.meta.parquet` files. If found and valid, it loads the pre-computed embeddings and metadata.
+    *   **Checks for Existing Index:** For each PDF, it looks for corresponding `.faissindex` and `.meta.parquet` files. If found and valid (including a 1536-dimension check), it loads the pre-computed embeddings and metadata.
     *   **PDF Parsing:** If no index exists, it opens the PDF using `PyMuPDF` (`fitz`).
-    *   **Text Extraction & Chunking:** Extracts text content page by page and splits it into manageable chunks.
-    *   **Image Extraction & Description:** Extracts images from each page. For significant images, it uses the Vertex AI Gemini model (`gemini-2.0-flash`) to generate a detailed textual description (e.g., summarizing charts, describing scenes, extracting table data).
-    *   **Embedding Generation:** Generates vector embeddings for each text chunk and each *image description* using Google's `text-embedding-005` model via the `google-genai` SDK. This is the core of the **multimodal** capability – representing both text and image content in the same vector space.
-    *   **Metadata Storage:** Stores metadata for each embedding (source document, page number, content type - text/image, the actual text chunk or image description, and image path if applicable) in a Pandas DataFrame.
+    *   **Text Extraction & Chunking:** Extracts text content page by page and splits it into overlapping, word-boundary chunks so context is preserved across chunk edges.
+    *   **Image Extraction & Description:** Extracts images from each page. For significant images, it uses the `gpt-5.4-mini` vision model to generate a detailed textual description (e.g., summarizing charts, describing scenes, extracting table data). Images in formats the vision API can't read are converted (via Pillow) before captioning.
+    *   **Embedding Generation:** Generates 1536-dimensional vector embeddings for each text chunk and each *image description* using OpenAI's `text-embedding-3-small` model.
+    *   **Metadata Storage:** Stores metadata for each embedding (source document, page number, content type — text/image, the actual text chunk or image description, and image path if applicable) in a Pandas DataFrame.
     *   **FAISS Indexing:** Builds a FAISS `IndexFlatIP` (Inner Product similarity) using the generated embeddings (normalized L2 vectors).
     *   **Persistence:** Saves the FAISS index (`.faissindex`) and the metadata DataFrame (`.meta.parquet`) to disk, named after the source PDF.
     *   **Combination:** Loads/combines the indexes and metadata from all provided PDFs into a single, unified FAISS index and metadata DataFrame for querying.
 
 2.  **Real-time Interaction Loop:**
-    *   **Connect to Gemini Live:** Establishes a connection to the `gemini-2.0-flash-live-preview-04-09` model using the `google-genai` SDK's `live.connect`. Configures the desired output language, voice, and system instructions.
-    *   **User Voice Input:** Waits for the user to press Enter, then records audio from the microphone using `PyAudio`. Pressing Enter again stops recording.
-    *   **Speech-to-Text:** Sends the recorded audio data to the Google Cloud Speech-to-Text API (via `google-cloud-speech`) for transcription in the specified input language.
-    *   **RAG Retrieval (FAISS Search):**
-        *   Generates an embedding for the transcribed user query (using `text-embedding-005` with `task_type="RETRIEVAL_QUERY"`).
-        *   Searches the combined FAISS index for the top-K embeddings most similar (highest inner product) to the query embedding.
-        *   Retrieves the corresponding metadata (text chunks or image descriptions) for the top results from the Pandas DataFrame.
-    *   **Context Augmentation:** Constructs a prompt for the Gemini Live model containing:
-        *   A system instruction (e.g., "Answer based only on the provided context...").
-        *   The retrieved context (formatted text snippets and/or image descriptions with source information).
-        *   The user's transcribed question.
-    *   **Send to Gemini Live:** Sends the augmented prompt to the active Gemini Live session.
-    *   **Receive Streaming Response:** Receives the response from Gemini Live, which includes:
-        *   Streaming audio chunks for the spoken answer.
-        *   (Optional) Text transcription of the spoken answer.
-    *   **Audio Playback:** Plays the received audio chunks back to the user in real-time using `PyAudio`.
-    *   **Display Transcription:** Shows the final text transcription of the model's response (if available).
-    *   **Loop:** Waits for the user to press Enter to ask another question.
+    *   **Connect to OpenAI Realtime:** Establishes a Realtime session with the `gpt-realtime-mini` model via the `AsyncOpenAI` SDK (`realtime.connect`). Configures the output language, voice, grounding instructions, and the `search_documents` tool.
+    *   **User Voice Input (Push-to-Talk):** Interaction is half-duplex push-to-talk. Press `Enter` to start recording from the microphone, `Enter` again to stop. Mic audio is captured as 24kHz PCM16 mono. Recording then playing (rather than full-duplex) avoids the model hearing its own output since there is no acoustic echo cancellation.
+    *   **Speech-to-Text (in-session):** The captured audio is streamed to the same Realtime session, which transcribes it — no separate transcription API call.
+    *   **RAG Retrieval via Tool Call:** The model calls the `search_documents` tool with a query. The app embeds the query with `text-embedding-3-small`, FAISS over-fetches ~20 candidates, `gpt-5.4-mini` reranks to the top 5, and the grounded context is returned to the session as the tool result.
+    *   **Grounded Spoken Response:** With the retrieved context in hand, the model generates and streams back the spoken answer, constrained to answer from the retrieved documents.
+    *   **Audio Playback:** Plays the streamed 24kHz PCM16 audio chunks back to the user using `PyAudio`.
+    *   **Display Transcription:** Prints the transcript of your question and of the model's spoken response.
+    *   **Loop:** Waits for the user to press Enter to ask another question. Press `Ctrl+C` to exit gracefully.
 
 ## Technology Stack
 
-*   **Programming Language:** Python 3.9+
-*   **Core AI/ML:**
-    *   **Google Generative AI SDK (`google-genai`):** Used for Gemini Live API interaction and Text Embedding generation.
-    *   **Vertex AI SDK (`vertexai`):** Used for generating image descriptions via Gemini models.
-    *   **Google Cloud Speech-to-Text API (`google-cloud-speech`):** For transcribing user voice input.
+*   **Programming Language:** Python 3.11+ (the app uses `asyncio.TaskGroup` and `except*`, which require 3.11+).
+*   **Core AI/ML (OpenAI):**
+    *   **OpenAI Realtime API (`gpt-realtime-mini`):** A single session doing speech-to-text, reasoning, and text-to-speech, driven via the `AsyncOpenAI` SDK's `realtime.connect`.
+    *   **Text Embeddings (`text-embedding-3-small`):** 1536-dimensional embeddings for text chunks and image descriptions.
+    *   **Vision (`gpt-5.4-mini`):** Generates textual descriptions of extracted images.
+    *   **Reranking (`gpt-5.4-mini`):** Reranks FAISS candidates down to the top 5 most relevant passages.
     *   **FAISS (`faiss-cpu`):** For efficient vector similarity search.
 *   **Document Processing:**
     *   **PyMuPDF (`fitz`):** For parsing PDF files, extracting text and images.
-    *   **Pillow (`PIL`):** For basic image handling (used indirectly by `fitz`).
+    *   **Pillow (`PIL`):** For image handling and converting unsupported image formats before captioning.
     *   **Pandas (`pandas`):** For managing metadata associated with embeddings.
     *   **PyArrow (`pyarrow`):** Required by Pandas for efficient Parquet file I/O (metadata storage).
 *   **Audio Handling:**
-    *   **PyAudio (`pyaudio`):** For recording microphone input and playing audio output.
-    *   **SoundDevice (`sounddevice`):** (Often a dependency or alternative for audio I/O, though PyAudio is directly used here).
+    *   **PyAudio (`pyaudio`):** For recording 24kHz PCM16 microphone input and playing audio output.
 *   **Concurrency:**
     *   **Asyncio:** Python's built-in library for asynchronous programming.
 *   **Configuration:**
-    *   **Python-Dotenv (`python-dotenv`):** For managing environment variables (API keys, project settings).
+    *   **Python-Dotenv (`python-dotenv`):** For loading the `OPENAI_API_KEY` from a `.env` file.
 *   **Numerical Computation:**
     *   **NumPy (`numpy`):** For numerical operations, especially on embeddings.
-    *   **Scikit-learn (`scikit-learn`):** Used for `cosine_similarity` if needed, though FAISS handles the primary search here.
 
-## Prerequisites (Google Cloud Setup)
+## Prerequisites
 
-1.  **Google Cloud Account:** You need a Google Cloud Platform account with billing enabled.
-2.  **Google Cloud Project:** Create a new project or select an existing one.
-3.  **Enable APIs:** In your Google Cloud project, enable the following APIs:
-    *   **Vertex AI API:** Essential for accessing Gemini models for image description and potentially embeddings/generation if configured that way.
-    *   **Cloud Speech-to-Text API:** Required for transcribing your voice input.
-    *   *(The Generative Language API used by `google-genai` for live connection and embeddings is often implicitly enabled or managed under Vertex AI, but ensure there are no restrictions)*.
-4.  **Authentication:** You need to authenticate your environment to use Google Cloud services. The recommended way is using Application Default Credentials (ADC):
-    *   Install the Google Cloud CLI (`gcloud`): [Installation Guide](https://cloud.google.com/sdk/docs/install)
-    *   Log in and set up ADC:
-        ```bash
-        gcloud auth application-default login
-        gcloud config set project YOUR_PROJECT_ID
-        ```
-        Replace `YOUR_PROJECT_ID` with your actual Google Cloud project ID. This command will open a browser window for you to log in with your Google account.
-5.  **Audio Setup:** Ensure your microphone and speakers are correctly configured on your system. You might need to install system libraries for `pyaudio` (like `portaudio`). See the [PyAudio documentation](http://people.csail.mit.edu/hubert/pyaudio/) for platform-specific requirements if you encounter installation issues.
+1.  **Python 3.11+:** The application relies on `asyncio.TaskGroup` and `except*`, which are only available in Python 3.11 and newer.
+2.  **OpenAI API Key:** You need an OpenAI API key with access to the Realtime, embeddings, and vision-capable chat models used above.
+3.  **Audio Setup:** Ensure your microphone and speakers are correctly configured on your system. You might need to install system libraries for `pyaudio` (like `portaudio`). See the [PyAudio documentation](http://people.csail.mit.edu/hubert/pyaudio/) for platform-specific requirements if you encounter installation issues.
 
 ## Installation & Setup
 
@@ -125,17 +105,14 @@ The application follows these steps:
 
 4.  **Configure Environment Variables:**
     *   Create a file named `.env` in the root directory of the project.
-    *   Add the following lines, replacing the placeholder with your Google Cloud Project ID and the region where you enabled the APIs (often `us-central1` for Vertex AI):
+    *   Add your OpenAI API key:
 
     ```dotenv
     # .env file
-    GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-    GOOGLE_CLOUD_REGION=us-central1
-    GOOGLE_GENAI_USE_VERTEXAI=True
-    # GEMINI_API_KEY= (Optional - Usually not needed when using Vertex AI with gcloud ADC)
+    OPENAI_API_KEY=sk-...
     ```
 
-5.  **Set up Google Cloud Authentication:** Ensure you have run `gcloud auth application-default login` as described in the Prerequisites.
+    This is the only configuration the app requires.
 
 ## Usage
 
@@ -148,8 +125,10 @@ python module_v2v_rag.py path/to/your/document1.pdf [path/to/another/document2.p
 **Arguments:**
 
 *   `pdf_paths`: (Required) One or more paths to PDF files.
-*   `--language`: (Optional) The language code for both input transcription and output speech (e.g., `en-US`, `hi-IN`, `es-US`). Defaults to `hi-IN`. See `SUPPORTED_LANGUAGES` in the script for options.
-*   `--voice`: (Optional) The desired output voice name (e.g., `Aoede`, `Puck`, `Charon`). Defaults to `Aoede`. See `AVAILABLE_VOICES` in the script for options.
+*   `--language`: (Optional) The BCP-47 language code for both input transcription and output speech (e.g., `en-US`, `hi-IN`, `ta-IN`). Defaults to `hi-IN`. The code is mapped internally to an ISO-639-1 code (e.g. `hi-IN` → `hi`) for the transcription language hint. See `SUPPORTED_LANGUAGES` in the script for options.
+*   `--voice`: (Optional) The OpenAI Realtime output voice. Defaults to `alloy`. Available voices: `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`.
+*   `--selfcheck`: (Optional) Prints the Realtime session payload as JSON and exits. Requires no microphone and makes no API calls (beyond importing the module) — useful for verifying session configuration.
+*   `--rebuild`: (Optional) Rebuilds the FAISS indexes from the given PDFs, then exits. No microphone is used. Use this to regenerate indexes (e.g. after upgrading embeddings).
 
 **Interaction:**
 
@@ -158,24 +137,24 @@ python module_v2v_rag.py path/to/your/document1.pdf [path/to/another/document2.p
 3.  Press `Enter`. The application will start recording audio from your microphone (`[Recording... Press ENTER to stop]`).
 4.  Speak your question clearly.
 5.  Press `Enter` again to stop recording.
-6.  The application will transcribe your audio, search the document index, send the query and context to Gemini Live, receive the audio response, and play it back. The transcribed response may also be printed.
+6.  The application streams your audio to the Realtime session, which transcribes it; the model calls `search_documents`, the app runs FAISS + rerank, and the model speaks a grounded answer, which is played back. Your question and the response transcript are printed.
 7.  The prompt `>>> Press ENTER to record... <<<` will reappear, allowing you to ask another question.
 8.  Press `Ctrl+C` to exit the application gracefully.
 
-## Configuration (`.env` file)
+## Development / Testing
 
-*   `GOOGLE_CLOUD_PROJECT`: **Required.** Your Google Cloud project ID where APIs are enabled.
-*   `GOOGLE_CLOUD_REGION`: **Required.** The Google Cloud region for Vertex AI services (e.g., `us-central1`).
-*   `GOOGLE_GENAI_USE_VERTEXAI`: Should be set to `True` to use Vertex AI infrastructure and authentication (recommended).
-*   `GEMINI_API_KEY`: Generally **not required** if you use `gcloud auth application-default login` (ADC). Only needed if you intend to authenticate directly with an API key via the `google-genai` SDK without Vertex integration (which is not the default setup in `config.py`).
+Install the development dependencies and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
 
 ## Future Improvements
 
 *   **Web Frontend:** Create a user-friendly web interface (using Flask, Streamlit, Gradio, etc.) to replace the command-line interaction, allowing easier PDF upload, language/voice selection, and chat history display.
 *   **Enhanced RAG Strategies:**
-    *   Implement re-ranking of retrieved results for better relevance.
     *   Explore query expansion techniques.
-    *   Use more sophisticated chunking strategies.
 *   **Support More Document Types:** Extend parsing capabilities beyond PDFs to include `.docx`, `.html`, `.txt`, etc.
 *   **GPU Acceleration:** Utilize `faiss-gpu` if a compatible GPU is available for even faster indexing and searching on very large datasets.
 *   **Improved Error Handling:** Add more robust error handling and user feedback for API issues, file processing errors, or audio device problems.

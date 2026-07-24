@@ -1,15 +1,9 @@
 python-dotenv>=1.0.0
-google-genai
+openai>=2.0,<3
 numpy
-sounddevice
 pyaudio
-google-cloud-speech
-google.cloud.aiplatform 
-vertexai
-scikit-learn
-pypdf2
 pandas
-PyMuPDF 
+PyMuPDF
 Pillow
 faiss-cpu
 pyarrow
