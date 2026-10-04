@@ -213,6 +213,8 @@ def test_stale_index_rejection(tmp_path, monkeypatch):
 
     inst = m.VoiceRAGMultimodalFAISS.__new__(m.VoiceRAGMultimodalFAISS)
     inst.pdf_paths = [str(pdf)]
+    inst.cache_dir = tmp_path
+    inst.image_save_dir = tmp_path / "images"
     inst.client = mock.Mock()
     inst.faiss_index = None
     inst.metadata_db = None

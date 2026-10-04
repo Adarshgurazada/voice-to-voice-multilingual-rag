@@ -563,35 +563,37 @@ def _format_context(rows) -> str:
     return "\n".join(context_parts)
 
 
-def find_relevant_context_faiss(query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int) -> str:
-    """Find relevant items via FAISS over-fetch + rerank; return formatted context."""
+def retrieve_context_and_sources(
+    query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int
+) -> tuple[str, list[dict]]:
+    """Return grounded context and its source rows for voice and UI callers."""
     print("Status: Finding relevant document context using FAISS...")
     if faiss_index is None or metadata_db is None or metadata_db.empty:
-        return "No document context available."
+        return "No document context available.", []
 
     try:
         query_embedding = get_text_embedding(client, query)
         if query_embedding is None:
-            return "Could not process query embedding."
+            return "Could not process query embedding.", []
 
         query_embedding_np = np.array([query_embedding], dtype=np.float32)
         faiss.normalize_L2(query_embedding_np)
 
         k = min(RAG_CANDIDATE_K, faiss_index.ntotal)
         if k <= 0:
-            return "No relevant context found in documents."
+            return "No relevant context found in documents.", []
         print(f" - Searching FAISS index (k={k})...")
         _, indices = faiss_index.search(query_embedding_np, k)
 
         if indices.size == 0:
             print(" - No relevant items found in index.")
-            return "No relevant context found in documents."
+            return "No relevant context found in documents.", []
 
         retrieved_indices = indices[0]
         retrieved_indices = retrieved_indices[retrieved_indices != -1]
         if len(retrieved_indices) == 0:
             print(" - No relevant items found in index (all results were invalid).")
-            return "No relevant context found in documents."
+            return "No relevant context found in documents.", []
 
         candidate_rows = metadata_db.iloc[retrieved_indices]
         candidate_texts = [str(c) for c in candidate_rows["content"].tolist()]
@@ -603,11 +605,21 @@ def find_relevant_context_faiss(query: str, faiss_index, metadata_db: pd.DataFra
         selected_rows = candidate_rows.iloc[selected_positions]
 
         print(f" - Top {len(selected_rows)} relevant items selected.")
-        return _format_context(selected_rows)
+        sources = [
+            {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"])}
+            for _, row in selected_rows.iterrows()
+        ]
+        return _format_context(selected_rows), sources
 
     except Exception as e:  # noqa: BLE001
         print(f"Error searching FAISS index: {e}", file=sys.stderr)
-        return "Error retrieving context from index."
+        return "Error retrieving context from index.", []
+
+
+def find_relevant_context_faiss(query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int) -> str:
+    """Find relevant items via FAISS over-fetch + rerank; return formatted context."""
+    context, _ = retrieve_context_and_sources(query, faiss_index, metadata_db, client, top_k)
+    return context
 
 
 # --- Realtime session payload (pure function; no clients/PyAudio/socket) ---
@@ -660,10 +672,15 @@ def build_session_payload(language: str, voice: str) -> dict:
 
 # --- Main Application Class ---
 class VoiceRAGMultimodalFAISS:
-    def __init__(self, pdf_paths: list[str], language=DEFAULT_LANGUAGE, voice=DEFAULT_VOICE):
+    def __init__(
+        self, pdf_paths: list[str], language=DEFAULT_LANGUAGE, voice=DEFAULT_VOICE,
+        cache_dir: str | Path = ".", image_save_dir: str | Path = IMAGE_SAVE_DIR,
+    ):
         self.language_code = language
         self.selected_voice = voice
         self.pdf_paths = pdf_paths
+        self.cache_dir = Path(cache_dir)
+        self.image_save_dir = Path(image_save_dir)
         self.faiss_index = None  # Combined FAISS index
         self.metadata_db = None  # Combined metadata DataFrame
         self.playback_queue = asyncio.Queue()
@@ -715,14 +732,16 @@ class VoiceRAGMultimodalFAISS:
             self.is_active = False
             return
 
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
         all_metadata = []
         all_embeddings = []
         final_dimension = None
 
         for pdf_path in self.pdf_paths:
             base_name = Path(pdf_path).stem
-            faiss_file = Path(f"{base_name}{FAISS_INDEX_SUFFIX}")
-            meta_file = Path(f"{base_name}{METADATA_SUFFIX}")
+            faiss_file = self.cache_dir / f"{base_name}{FAISS_INDEX_SUFFIX}"
+            meta_file = self.cache_dir / f"{base_name}{METADATA_SUFFIX}"
 
             if faiss_file.exists() and meta_file.exists():
                 print(f"Status: Loading existing index for {os.path.basename(pdf_path)}...")
@@ -794,7 +813,7 @@ class VoiceRAGMultimodalFAISS:
             # Build if loading failed or files don't exist
             print(f"Status: Building index for {os.path.basename(pdf_path)}...")
             meta_list, embeds_list, dim = await asyncio.to_thread(
-                build_or_load_index, pdf_path, self.client, IMAGE_SAVE_DIR
+                build_or_load_index, pdf_path, self.client, str(self.image_save_dir)
             )
 
             if not meta_list or not embeds_list or dim is None:
