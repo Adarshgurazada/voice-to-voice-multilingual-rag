@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Study Companion</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Voice Study Companion</h1>
+      <p id="document-name">No documents loaded</p>
+    </div>
+    <div class="connection-state"><span id="state-dot"></span><span id="call-state">Offline</span></div>
+  </header>
+
+  <section class="document-band" aria-label="Documents">
+    <form id="document-form">
+      <label for="pdf-files">Documents</label>
+      <input id="pdf-files" name="files" type="file" accept="application/pdf,.pdf" multiple required>
+      <button id="index-button" type="submit">Index documents</button>
+    </form>
+    <div id="index-progress" class="index-progress" hidden>
+      <progress id="progress-bar" max="100" value="0"></progress>
+      <span id="progress-text" role="status">Preparing documents</span>
+    </div>
+  </section>
+
+  <main class="workspace">
+    <section class="conversation" aria-label="Live transcript">
+      <div class="section-heading"><h2>Conversation</h2><span id="turn-state">Idle</span></div>
+      <div id="transcript" class="transcript" aria-live="polite"></div>
+    </section>
+    <aside class="evidence" aria-label="Retrieved pages">
+      <div class="section-heading"><h2>Sources</h2></div>
+      <div id="sources" class="source-list"></div>
+      <img id="page-image" class="page-image" alt="Selected source page" hidden>
+    </aside>
+  </main>
+
+  <footer class="callbar">
+    <button id="connect-button" type="button" disabled>Connect</button>
+    <button id="mute-button" type="button" aria-pressed="false" disabled>Mute mic</button>
+    <span id="call-message" role="status">Index a PDF to begin.</span>
+  </footer>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

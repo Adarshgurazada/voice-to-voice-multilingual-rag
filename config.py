@@ -23,5 +23,7 @@ EMBEDDING_DIM = 1536
 VISION_MODEL_ID = "gpt-5.4-mini"
 # Model used for reranking retrieved candidates.
 RERANK_MODEL_ID = "gpt-5.4-mini"
+# Model for grounded practice question generation and formative feedback.
+QUIZ_MODEL_ID = "gpt-5.4-mini"
 # Transcription model used for the realtime input transcription hint.
 TRANSCRIBE_MODEL_ID = "gpt-4o-mini-transcribe"

@@ -1,15 +1,12 @@
-# module_v2v_rag.py
-
 import asyncio
 import sys
 import os
 import base64
 import json
 import io
-import argparse
 import time  # For simple delays / backoff
 import pandas as pd
-import fitz  # PyMuPDF for image extraction
+import pymupdf as fitz  # PyMuPDF for image extraction
 from PIL import Image as PIL_Image
 from pathlib import Path
 
@@ -34,7 +31,6 @@ from openai import OpenAI, AsyncOpenAI
 try:
     from config import (
         OPENAI_API_KEY,
-        REALTIME_MODEL_ID,
         EMBEDDING_MODEL_ID,
         EMBEDDING_DIM,
         VISION_MODEL_ID,
@@ -45,35 +41,19 @@ except ImportError:
     print("Error: Could not import config.py.", file=sys.stderr)
     sys.exit(1)
 
-# --- Audio Constants ---
-# OpenAI realtime audio is pcm16, 24kHz, mono in both directions.
-INPUT_RATE = 24000
-OUTPUT_RATE = 24000
-CHANNELS = 1
-CHUNK_SIZE = 1024
-# PyAudio format constant is resolved lazily (pyaudio only imported in voice mode).
-
 # --- RAG Constants ---
 RAG_TEXT_CHUNK_SIZE = 800
 RAG_CHUNK_OVERLAP = 150
 RAG_TOP_K = 5
 RAG_CANDIDATE_K = 20
 RERANK_TIMEOUT_S = 4.0
-IMAGE_SAVE_DIR = "extracted_images"
+IMAGE_SAVE_DIR = ".local_data/images"
 
 # --- FAISS Index File Suffixes ---
 FAISS_INDEX_SUFFIX = ".faissindex"
 METADATA_SUFFIX = ".meta.parquet"
 
-# --- Realtime turn handling ---
-TURN_TIMEOUT_S = 30
-# Retrieval mode: "tool" (model calls search_documents) or "inject" (deterministic
-# fallback that always retrieves on the transcript and injects context as text).
-RAG_MODE = os.getenv("RAG_MODE", "tool").lower()
-
-# --- Session Configuration ---
-DEFAULT_VOICE = "alloy"
-DEFAULT_LANGUAGE = "hi-IN"
+# --- Realtime voice options ---
 SUPPORTED_LANGUAGES = [
     "en-US", "ta-IN", "gu-IN", "mr-IN", "te-IN", "bn-IN",
     "kn-IN", "hi-IN", "ml-IN", "en-GB", "en-IN",
@@ -343,7 +323,9 @@ def _normalize_image(image_bytes: bytes, ext: str) -> tuple[bytes, str, str] | N
 
 
 # --- FAISS Index Building / Loading ---
-def build_or_load_index(pdf_path_str: str, client: OpenAI, image_save_dir: str) -> tuple[list, list, int | None]:
+def build_or_load_index(
+    pdf_path_str: str, client: OpenAI, image_save_dir: str, progress_callback=None,
+) -> tuple[list, list, int | None]:
     """Process a single PDF: extract text/images, embed, return metadata + embeddings.
 
     Returns (metadata_list, embeddings_list, detected_dimension).
@@ -444,6 +426,8 @@ def build_or_load_index(pdf_path_str: str, client: OpenAI, image_save_dir: str) 
                     )
                 except Exception as img_err:  # noqa: BLE001
                     print(f"\nError processing image {img_index} on page {page_id}: {img_err}", file=sys.stderr)
+            if progress_callback is not None:
+                progress_callback(page_id, num_pages)
         print()  # Newline after document
     except Exception as e:  # noqa: BLE001
         print(f"Error processing document {pdf_path_str}: {e}", file=sys.stderr)
@@ -616,15 +600,9 @@ def retrieve_context_and_sources(
         return "Error retrieving context from index.", []
 
 
-def find_relevant_context_faiss(query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int) -> str:
-    """Find relevant items via FAISS over-fetch + rerank; return formatted context."""
-    context, _ = retrieve_context_and_sources(query, faiss_index, metadata_db, client, top_k)
-    return context
-
-
-# --- Realtime session payload (pure function; no clients/PyAudio/socket) ---
+# --- Realtime session payload ---
 def build_session_payload(language: str, voice: str) -> dict:
-    """Build the GA realtime session payload.
+    """Build the Realtime session payload.
 
     Notes:
     - ``output_modalities`` is ``["audio"]`` only; audio already carries an
@@ -673,44 +651,24 @@ def build_session_payload(language: str, voice: str) -> dict:
 # --- Main Application Class ---
 class VoiceRAGMultimodalFAISS:
     def __init__(
-        self, pdf_paths: list[str], language=DEFAULT_LANGUAGE, voice=DEFAULT_VOICE,
+        self, pdf_paths: list[str],
         cache_dir: str | Path = ".", image_save_dir: str | Path = IMAGE_SAVE_DIR,
     ):
-        self.language_code = language
-        self.selected_voice = voice
         self.pdf_paths = pdf_paths
         self.cache_dir = Path(cache_dir)
         self.image_save_dir = Path(image_save_dir)
         self.faiss_index = None  # Combined FAISS index
         self.metadata_db = None  # Combined metadata DataFrame
-        self.playback_queue = asyncio.Queue()
-        self.p_audio = None  # PyAudio handle; created lazily in voice mode only.
-        self.output_stream = None
         self.is_active = True
         self.client = None  # sync OpenAI client
         self.async_client = None  # AsyncOpenAI client for realtime
-        # Saved transcript for the current turn (display / query fallback).
-        self.last_transcript = ""
-        self._validate_config()
         self._initialize_clients()
-        print("--- OpenAI Voice RAG (FAISS - Realtime STT+LLM+TTS) ---")
-        print(f"Output Voice: {self.selected_voice}, Language: {self.language_code}")
-        print(f"Input: Mic ({INPUT_RATE} Hz), Output: Speaker ({OUTPUT_RATE} Hz)")
+        print("--- OpenAI Voice RAG (FAISS + Realtime) ---")
         print(f"Processing documents: {', '.join(os.path.basename(p) for p in pdf_paths)}")
         print("Status: Initializing...")
 
-    def _validate_config(self):
-        if self.selected_voice not in AVAILABLE_VOICES:
-            print(
-                f"Warning: Voice '{self.selected_voice}' not available; using '{DEFAULT_VOICE}'.",
-                file=sys.stderr,
-            )
-            self.selected_voice = DEFAULT_VOICE
-        if self.language_code not in SUPPORTED_LANGUAGES:
-            print(f"Warning: Lang code '{self.language_code}' not known.", file=sys.stderr)
-
     def _initialize_clients(self):
-        """Initialize OpenAI clients. PyAudio is NOT touched here."""
+        """Initialize clients for indexing, retrieval, and Realtime voice."""
         try:
             self.client = OpenAI(api_key=OPENAI_API_KEY)
             self.async_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -719,19 +677,12 @@ class VoiceRAGMultimodalFAISS:
             print(f"Error initializing clients: {e}", file=sys.stderr)
             sys.exit(1)
 
-    def _ensure_audio(self):
-        """Create the PyAudio handle on demand (voice mode only)."""
-        if self.p_audio is None:
-            import pyaudio  # imported lazily so --selfcheck/--rebuild never need it
-            self.p_audio = pyaudio.PyAudio()
-
-    async def setup_rag_database(self):
+    async def setup_rag_database(self, progress_callback=None):
         """Load or build FAISS index and metadata for all specified PDFs."""
         if not self.client:
             print("Error: Clients not initialized.", file=sys.stderr)
             self.is_active = False
             return
-
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         all_metadata = []
@@ -798,6 +749,8 @@ class VoiceRAGMultimodalFAISS:
                         all_metadata.append(loaded_meta)
                         all_embeddings.append(loaded_embeddings)
                         print(f"  - Loaded {loaded_index.ntotal} vectors.")
+                        if progress_callback is not None:
+                            progress_callback(pdf_path, 1, 1)
                         continue  # loaded successfully
                 except Exception as e:  # noqa: BLE001
                     print(f"Warning: Failed to load index for {pdf_path}: {e}. Rebuilding...", file=sys.stderr)
@@ -812,9 +765,19 @@ class VoiceRAGMultimodalFAISS:
 
             # Build if loading failed or files don't exist
             print(f"Status: Building index for {os.path.basename(pdf_path)}...")
-            meta_list, embeds_list, dim = await asyncio.to_thread(
-                build_or_load_index, pdf_path, self.client, str(self.image_save_dir)
-            )
+            if progress_callback is None:
+                meta_list, embeds_list, dim = await asyncio.to_thread(
+                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir)
+                )
+            else:
+                loop = asyncio.get_running_loop()
+
+                def report_page(page, total, path=pdf_path):
+                    loop.call_soon_threadsafe(progress_callback, path, page, total)
+
+                meta_list, embeds_list, dim = await asyncio.to_thread(
+                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir), report_page
+                )
 
             if not meta_list or not embeds_list or dim is None:
                 print(f"Warning: Failed to process {pdf_path}, skipping.", file=sys.stderr)
@@ -878,499 +841,3 @@ class VoiceRAGMultimodalFAISS:
             )
             self.is_active = False
             return
-
-    async def start(self):
-        self.is_active = True
-        await self.setup_rag_database()
-        if not self.is_active:
-            print("Exiting due to RAG setup failure.")
-            return
-        # Open audio devices only now (voice mode). --selfcheck/--rebuild never reach here.
-        self._ensure_audio()
-        try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self.connect_and_manage_session())
-                tg.create_task(self.play_audio_output())
-            print("Status: TaskGroup finished.")
-        except* Exception as eg:
-            print("\nError group exceptions occurred:", file=sys.stderr)
-            for i, exc in enumerate(eg.exceptions):
-                if isinstance(exc, asyncio.CancelledError):
-                    print("- Task cancelled.")
-                else:
-                    print(f"- Exception {i + 1}/{len(eg.exceptions)}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        finally:
-            await self.stop()
-
-    async def stop(self):
-        if not self.is_active:
-            return
-        print("\nStatus: Initiating shutdown...")
-        self.is_active = False
-        await asyncio.sleep(0.2)
-        if getattr(self, "output_stream", None):
-            print("Status: Waiting for playback queue...")
-            try:
-                await asyncio.wait_for(self.playback_queue.join(), timeout=1.0)
-                print("Status: Playback queue empty.")
-            except asyncio.TimeoutError:
-                print("Warning: Timeout waiting playback.", file=sys.stderr)
-            except Exception as q_err:  # noqa: BLE001
-                print(f"Warning: Error joining queue: {q_err}", file=sys.stderr)
-            try:
-                if self.output_stream.is_active():
-                    self.output_stream.stop_stream()
-                self.output_stream.close()
-                print("Status: Output stream closed.")
-            except Exception as e:  # noqa: BLE001
-                print(f"Warning: Error closing output stream: {e}", file=sys.stderr)
-        if self.p_audio:
-            self.p_audio.terminate()
-            print("Status: PyAudio terminated.")
-        print("--- OpenAI Voice RAG Multimodal Finished ---")
-
-    def _clear_playback_queue(self):
-        try:
-            while True:
-                self.playback_queue.get_nowait()
-                self.playback_queue.task_done()
-        except asyncio.QueueEmpty:
-            pass
-
-    async def _run_retrieval(self, query: str) -> str:
-        """Run FAISS+rerank retrieval off the event loop."""
-        return await asyncio.to_thread(
-            find_relevant_context_faiss,
-            query,
-            self.faiss_index,
-            self.metadata_db,
-            self.client,
-            RAG_TOP_K,
-        )
-
-    async def _handle_media_event(self, event, etype, state) -> bool:
-        """Handle the media/error event branches shared by both turn consumers.
-
-        ``state`` is a mutable dict carrying the accumulated ``transcript``.
-        Returns True if the event was handled here; False otherwise. Raises
-        RuntimeError on an ``error`` event so the per-turn recovery can reset.
-        """
-        if etype in ("response.output_audio.delta", "response.audio.delta"):
-            delta = getattr(event, "delta", None)
-            if delta:
-                try:
-                    await self.playback_queue.put(base64.b64decode(delta))
-                except Exception:  # noqa: BLE001
-                    pass
-            return True
-
-        if etype in (
-            "response.output_audio_transcript.delta",
-            "response.audio_transcript.delta",
-        ):
-            state["transcript"] += getattr(event, "delta", "") or ""
-            if self.playback_queue.empty():
-                print(f"   Assistant (Text): {state['transcript']}", end="\r", flush=True)
-            return True
-
-        if etype in (
-            "response.output_audio_transcript.done",
-            "response.audio_transcript.done",
-        ):
-            done_text = getattr(event, "transcript", None) or state["transcript"]
-            if done_text:
-                print(f"\n   Assistant: {done_text}", flush=True)
-            return True
-
-        if etype == "response.output_text.delta":
-            state["transcript"] += getattr(event, "delta", "") or ""
-            return True
-
-        if etype == "error":
-            err = getattr(event, "error", event)
-            print(f"\nError event from realtime API: {err}", file=sys.stderr)
-            raise RuntimeError(f"realtime error: {err}")
-
-        return False
-
-    async def _consume_turn(self, conn):
-        """Consume events for a single turn via the tool-call state machine.
-
-        Tracks the initial (tool-call) and continuation response ids and a
-        ``tool_output_sent`` flag so a stale ``response.done`` from a prior
-        failed/timed-out turn cannot be mistaken for this turn's completion:
-        - Transition tool -> continuation only after the tool output was sent AND
-          the completing ``response.done`` matches the initial response id (when
-          the SDK exposes ids) and reports status == "completed" (when available).
-        - End the turn only on a ``response.done`` matching the continuation
-          response id.
-        """
-        state_name = "tool"
-        pending_call_id = None
-        tool_output_sent = False
-        initial_response_id = None
-        continuation_response_id = None
-        ev_state = {"transcript": ""}
-
-        async for event in conn:
-            if not self.is_active:
-                break
-            etype = getattr(event, "type", "")
-
-            if etype == "conversation.item.input_audio_transcription.completed":
-                self.last_transcript = getattr(event, "transcript", "") or ""
-                print(f"   >> You asked: {self.last_transcript}", flush=True)
-
-            elif etype == "response.created":
-                rid = _event_response_id(event)
-                if state_name == "tool" and initial_response_id is None:
-                    initial_response_id = rid
-                elif state_name == "continuation" and continuation_response_id is None:
-                    continuation_response_id = rid
-
-            elif etype == "response.function_call_arguments.done":
-                if state_name != "tool":
-                    # Guard: continuation should not call the tool again.
-                    continue
-                query = _extract_query(getattr(event, "arguments", None), self.last_transcript)
-                pending_call_id = getattr(event, "call_id", None)
-                context = await self._run_retrieval(query)
-                await conn.conversation.item.create(
-                    item={
-                        "type": "function_call_output",
-                        "call_id": pending_call_id,
-                        "output": context,
-                    }
-                )
-                tool_output_sent = True
-
-            elif etype == "response.done":
-                rid = _event_response_id(event)
-                status = _event_response_status(event)
-                if state_name == "tool":
-                    # Only advance once the tool output was sent and this done
-                    # matches the initial response (id + status where available).
-                    if not tool_output_sent:
-                        continue
-                    if initial_response_id is not None and rid is not None and rid != initial_response_id:
-                        continue
-                    if status is not None and status != "completed":
-                        # Failed/incomplete tool response -> abort turn for recovery.
-                        raise RuntimeError(f"tool response not completed (status={status})")
-                    state_name = "continuation"
-                    await conn.response.create(response={"tool_choice": "none"})
-                else:
-                    # Continuation done -> end the turn (match id when available).
-                    if continuation_response_id is not None and rid is not None and rid != continuation_response_id:
-                        continue
-                    if status is not None and status not in ("completed", None):
-                        raise RuntimeError(f"continuation response not completed (status={status})")
-                    return
-
-            else:
-                await self._handle_media_event(event, etype, ev_state)
-
-    async def _consume_turn_inject(self, conn):
-        """Deterministic fallback turn (RAG_MODE='inject'): no tool call.
-
-        On the input transcription completing, retrieve context, inject it as a
-        user text message, then request a spoken answer with tool_choice='none'.
-        The turn ends on the response.done for that answer (matched by id when
-        the SDK exposes it).
-        """
-        state_name = "await_transcript"
-        answer_response_id = None
-        ev_state = {"transcript": ""}
-
-        async for event in conn:
-            if not self.is_active:
-                break
-            etype = getattr(event, "type", "")
-
-            if etype == "conversation.item.input_audio_transcription.completed":
-                self.last_transcript = getattr(event, "transcript", "") or ""
-                print(f"   >> You asked: {self.last_transcript}", flush=True)
-                context = await self._run_retrieval(self.last_transcript)
-                await conn.conversation.item.create(
-                    item={
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    f"Answer based ONLY on the context below.\n\n"
-                                    f"CONTEXT:\n{context}\n\n"
-                                    f"QUESTION: {self.last_transcript}"
-                                ),
-                            }
-                        ],
-                    }
-                )
-                state_name = "answer"
-                await conn.response.create(response={"tool_choice": "none"})
-
-            elif etype == "response.created":
-                if state_name == "answer" and answer_response_id is None:
-                    answer_response_id = _event_response_id(event)
-
-            elif etype == "response.done":
-                if state_name != "answer":
-                    continue
-                rid = _event_response_id(event)
-                if answer_response_id is not None and rid is not None and rid != answer_response_id:
-                    continue
-                return
-
-            else:
-                await self._handle_media_event(event, etype, ev_state)
-
-    async def _cancel_active_response(self, conn):
-        """Best-effort cancel of any in-flight response after a failed turn."""
-        try:
-            await conn.response.cancel()
-        except Exception:  # noqa: BLE001 - cancel may be unsupported or nothing active
-            pass
-
-    async def _drain_buffered_events(self, conn):
-        """Drain any buffered events so a stale response.done can't leak into the
-        next turn. Bounded by a short deadline; safe if nothing is queued."""
-        try:
-            await asyncio.wait_for(self._drain_loop(conn), timeout=1.0)
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-            pass
-
-    async def _drain_loop(self, conn):
-        async for _ in conn:
-            # Keep consuming until the transport briefly goes idle (timeout above
-            # ends the drain); we intentionally discard these stale events.
-            await asyncio.sleep(0)
-
-    async def connect_and_manage_session(self):
-        if self.client is None or self.metadata_db is None or self.faiss_index is None:
-            print("Error: OpenAI Client or RAG DB not ready.", file=sys.stderr)
-            self.is_active = False
-            return
-
-        print("Status: Connecting to OpenAI realtime API...")
-        try:
-            async with self.async_client.realtime.connect(model=REALTIME_MODEL_ID) as conn:
-                await conn.session.update(
-                    session=build_session_payload(self.language_code, self.selected_voice)
-                )
-                print("Status: Connected.")
-                print(f"Status: RAG_MODE={RAG_MODE}")
-                print("\n>>> Press ENTER to record, ENTER again to stop. (Ctrl+C to quit) <<<")
-
-                while self.is_active:
-                    await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
-                    if not self.is_active:
-                        break
-                    audio_frames = await self.record_audio()
-                    if not audio_frames or not self.is_active:
-                        continue
-
-                    # Stream captured pcm16 frames to the input buffer.
-                    audio_b64 = base64.b64encode(b"".join(audio_frames)).decode("ascii")
-                    await conn.input_audio_buffer.append(audio=audio_b64)
-                    await conn.input_audio_buffer.commit()
-
-                    self.last_transcript = ""
-                    try:
-                        if RAG_MODE == "inject":
-                            # Inject mode retrieves on the transcript; no initial tool call.
-                            await asyncio.wait_for(
-                                self._consume_turn_inject(conn), timeout=TURN_TIMEOUT_S
-                            )
-                        else:
-                            # Tool mode: kick off the required tool-call response.
-                            await conn.response.create()
-                            await asyncio.wait_for(
-                                self._consume_turn(conn), timeout=TURN_TIMEOUT_S
-                            )
-                    except asyncio.TimeoutError:
-                        print("\nWarning: Turn timed out; resetting.", file=sys.stderr)
-                        self.last_transcript = ""
-                        await self._cancel_active_response(conn)
-                        await self._drain_buffered_events(conn)
-                        self._clear_playback_queue()
-                    except RuntimeError as turn_err:
-                        print(f"\nWarning: Turn aborted ({turn_err}); resetting.", file=sys.stderr)
-                        self.last_transcript = ""
-                        await self._cancel_active_response(conn)
-                        await self._drain_buffered_events(conn)
-                        self._clear_playback_queue()
-
-                    if not self.is_active:
-                        break
-                    print("\n>>> Press ENTER to record... <<<")
-        except asyncio.CancelledError:
-            print("Status: Connection/Manage task cancelled.")
-        except Exception as e:  # noqa: BLE001
-            print(f"\nError in connect_and_manage: {type(e).__name__}: {e}", file=sys.stderr)
-            self.is_active = False
-            raise
-        finally:
-            print("Status: Exiting connect_and_manage loop.")
-
-    async def record_audio(self):
-        self._ensure_audio()
-        if not self.is_active or self.p_audio is None:
-            return None
-        import pyaudio
-        frames = []
-        input_stream_obj = None
-        print("[Recording... Press ENTER to stop]", end="", flush=True)
-        try:
-            input_stream_obj = self.p_audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS, rate=INPUT_RATE,
-                input=True, frames_per_buffer=CHUNK_SIZE,
-            )
-            recording_task = asyncio.create_task(self._read_audio_chunks(input_stream_obj, frames))
-            await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
-            print(" [Stopping Recording...]")
-        except OSError as e:
-            print(f"\nError opening input stream: {e}", file=sys.stderr)
-            return None
-        except Exception as e:  # noqa: BLE001
-            print(f"\nError during recording setup: {e}", file=sys.stderr)
-            return None
-        finally:
-            if "recording_task" in locals() and recording_task and not recording_task.done():
-                recording_task.cancel()
-                try:
-                    await recording_task
-                except asyncio.CancelledError:
-                    pass
-            if input_stream_obj:
-                try:
-                    input_stream_obj.stop_stream()
-                    input_stream_obj.close()
-                except Exception as close_e:  # noqa: BLE001
-                    print(f"Warning: Error closing recording stream: {close_e}", file=sys.stderr)
-        return frames if self.is_active else None
-
-    async def _read_audio_chunks(self, stream, frames):
-        try:
-            while True:
-                data = await asyncio.to_thread(stream.read, CHUNK_SIZE, exception_on_overflow=False)
-                frames.append(data)
-                await asyncio.sleep(0.01)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:  # noqa: BLE001
-            print(f"Error reading audio chunk: {e}", file=sys.stderr)
-
-    async def play_audio_output(self):
-        import pyaudio
-        print("Status: Waiting for PyAudio to start output stream...")
-        while self.p_audio is None and self.is_active:
-            await asyncio.sleep(0.1)
-        if not self.is_active or self.p_audio is None:
-            print("Status: Playback task exiting.")
-            return
-        print("Status: Starting audio output stream...")
-        try:
-            self.output_stream = self.p_audio.open(
-                format=pyaudio.paInt16, channels=CHANNELS, rate=OUTPUT_RATE, output=True
-            )
-            print("Status: Output stream opened.")
-            while self.is_active:
-                try:
-                    data = await asyncio.wait_for(self.playback_queue.get(), timeout=1.0)
-                    if data is None:
-                        continue
-                    await asyncio.to_thread(self.output_stream.write, data)
-                    self.playback_queue.task_done()
-                except asyncio.TimeoutError:
-                    if not self.is_active:
-                        break
-                    continue
-                except asyncio.CancelledError:
-                    print("Status: Playback task inner cancelled.")
-                    break
-                except OSError as write_err:
-                    print(f"Error writing to output stream: {write_err}", file=sys.stderr)
-                    self.is_active = False
-                    break
-                except Exception as inner_e:  # noqa: BLE001
-                    print(f"Error during playback loop: {type(inner_e).__name__}: {inner_e}", file=sys.stderr)
-                    self.is_active = False
-                    break
-        except asyncio.CancelledError:
-            print("Status: Playback task setup cancelled.")
-        except OSError as e:
-            print(f"\nPyAudio OSError in playback: {e}", file=sys.stderr)
-            self.is_active = False
-        except Exception as e:  # noqa: BLE001
-            print(f"\nUnexpected error in playback: {e}", file=sys.stderr)
-            self.is_active = False
-            raise
-        finally:
-            print("Status: Exiting play_audio_output loop.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OpenAI Realtime Voice RAG Multimodal w/ FAISS")
-    parser.add_argument("pdf_paths", nargs="+", help="Path(s) to the PDF document(s) to use for RAG.")
-    parser.add_argument("--language", default=DEFAULT_LANGUAGE, help=f"Input/Output language code (BCP-47). Default: {DEFAULT_LANGUAGE}")
-    parser.add_argument(
-        "--voice",
-        default=DEFAULT_VOICE,
-        help=f"Output voice. One of: {', '.join(AVAILABLE_VOICES)}. Default: {DEFAULT_VOICE}",
-    )
-    parser.add_argument(
-        "--selfcheck",
-        action="store_true",
-        help="Print the realtime session payload JSON and exit (no clients, no audio, no network).",
-    )
-    parser.add_argument(
-        "--rebuild",
-        action="store_true",
-        help="Build/save the FAISS indexes for the given PDFs and exit (no mic).",
-    )
-    args = parser.parse_args()
-
-    lang_arg, voice_arg = args.language, args.voice
-    if lang_arg not in SUPPORTED_LANGUAGES:
-        print(f"Warning: Invalid language '{args.language}', using default '{DEFAULT_LANGUAGE}'.")
-        lang_arg = DEFAULT_LANGUAGE
-    if voice_arg not in AVAILABLE_VOICES:
-        print(f"Warning: Invalid voice '{args.voice}', using default '{DEFAULT_VOICE}'.")
-        voice_arg = DEFAULT_VOICE
-
-    # --selfcheck: pure payload build; no clients / PyAudio / socket / PDFs required.
-    if args.selfcheck:
-        print(json.dumps(build_session_payload(lang_arg, voice_arg), indent=2))
-        sys.exit(0)
-
-    valid_paths = [p for p in args.pdf_paths if os.path.isfile(p) and p.lower().endswith(".pdf")]
-    if not valid_paths:
-        print("Error: No valid PDF documents provided.", file=sys.stderr)
-        sys.exit(1)
-    if len(valid_paths) != len(args.pdf_paths):
-        print("Warning: Some invalid paths were skipped.", file=sys.stderr)
-
-    client = VoiceRAGMultimodalFAISS(pdf_paths=valid_paths, language=lang_arg, voice=voice_arg)
-
-    # --rebuild: build indexes only, then exit (no mic).
-    if args.rebuild:
-        async def _rebuild():
-            await client.setup_rag_database()
-
-        try:
-            asyncio.run(_rebuild())
-            print("Status: Rebuild complete." if client.is_active else "Status: Rebuild finished with errors.")
-        except KeyboardInterrupt:
-            print("\nRebuild cancelled by user (Ctrl+C).")
-        sys.exit(0 if client.is_active else 1)
-
-    try:
-        print("Starting application...")
-        asyncio.run(client.start())
-    except KeyboardInterrupt:
-        print("\nExecution cancelled by user (Ctrl+C).")
-    except Exception as e:  # noqa: BLE001
-        print(f"\nAn unexpected error occurred in main execution: {type(e).__name__}: {e}", file=sys.stderr)
-    finally:
-        print("Application exiting.")

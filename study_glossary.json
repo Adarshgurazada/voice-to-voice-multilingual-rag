@@ -1,0 +1,27 @@
+{
+  "terms": [
+    {
+      "term": "cell",
+      "aliases": ["cells"],
+      "explanations": {
+        "en-US": "A cell is a tiny building block of living things.",
+        "hi-IN": "कोशिका जीवित चीज़ों की एक बहुत छोटी इकाई है।"
+      }
+    },
+    {
+      "term": "photosynthesis",
+      "explanations": {
+        "en-US": "Photosynthesis is how plants use sunlight to make their own food.",
+        "hi-IN": "प्रकाश संश्लेषण वह प्रक्रिया है जिसमें पौधे सूरज की रोशनी से अपना भोजन बनाते हैं।"
+      }
+    },
+    {
+      "term": "fraction",
+      "aliases": ["fractions"],
+      "explanations": {
+        "en-US": "A fraction shows a part of a whole, such as one half of an apple.",
+        "hi-IN": "भिन्न किसी पूरी चीज़ का एक हिस्सा दिखाता है, जैसे आधा सेब।"
+      }
+    }
+  ]
+}

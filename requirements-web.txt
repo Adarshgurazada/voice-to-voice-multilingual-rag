@@ -1,3 +1,5 @@
 -r requirements.txt
-gradio>=6,<7
-scipy>=1.11,<2
+mcp>=2.3,<3
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.9,<1
