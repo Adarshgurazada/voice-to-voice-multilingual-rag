@@ -34,6 +34,10 @@ h2 { font-size: 16px; margin: 0; }
 .source-list { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
 .source-list button { background: white; color: #17694d; font-size: 13px; padding: 6px 9px; }
 .source-list button.active { background: #dceee5; }
+.citation-link { display: inline; border: 0; padding: 0 2px; background: transparent; color: #17694d; font: inherit; text-decoration: underline; }
+.citation-link:hover { background: #dceee5; }
+.source-excerpt { margin: 0 0 12px; color: #44545d; font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; max-height: 7em; overflow: auto; }
+.voice-metrics { margin-left: auto; color: #52616b; font-size: 12px; white-space: nowrap; }
 .page-image { max-width: 100%; max-height: calc(100vh - 310px); object-fit: contain; border: 1px solid #d8dfdd; background: white; }
 .callbar { position: sticky; bottom: 0; background: white; border-top: 1px solid #d8dfdd; display: flex; align-items: center; gap: 12px; padding: 14px 24px; }
 #connect-button.disconnect { background: #fff; color: #a3332e; border-color: #a3332e; }
@@ -48,4 +52,5 @@ h2 { font-size: 16px; margin: 0; }
   .transcript { max-height: 42vh; }
   .callbar { flex-wrap: wrap; }
   #call-message { width: 100%; }
+  .voice-metrics { margin-left: 0; }
 }

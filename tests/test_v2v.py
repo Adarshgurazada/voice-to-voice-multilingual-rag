@@ -26,6 +26,50 @@ def test_chunking_empty_and_whitespace():
     assert m.chunk_text("   \n\t ") == []
 
 
+def test_ocr_runs_only_on_low_text_image_page():
+    class Page:
+        def __init__(self, text, images):
+            self.text = text
+            self.images = images
+            self.ocr_calls = 0
+
+        def get_text(self, mode, textpage=None):
+            return "Scanned lesson text" if textpage is not None else self.text
+
+        def get_images(self, full=True):
+            return self.images
+
+        def get_textpage_ocr(self, **kwargs):
+            self.ocr_calls += 1
+            assert kwargs["language"] == "eng+hin"
+            return object()
+
+    scanned = Page("", [object()])
+    assert m.extract_page_text(scanned, "auto", "eng+hin") == ("Scanned lesson text", "ocr")
+    assert scanned.ocr_calls == 1
+    selectable = Page("Long selectable text " * 5, [object()])
+    assert m.extract_page_text(selectable)[1] == "text"
+    assert selectable.ocr_calls == 0
+    assert m.extract_page_text(scanned, "off")[1] == "text"
+    assert scanned.ocr_calls == 1
+
+
+def test_ocr_failure_is_actionable():
+    class Page:
+        def get_text(self, mode, textpage=None):
+            return ""
+
+        def get_images(self, full=True):
+            return [object()]
+
+        def get_textpage_ocr(self, **kwargs):
+            raise RuntimeError("tessdata missing")
+
+    import pytest
+    with pytest.raises(RuntimeError, match="Install Tesseract"):
+        m.extract_page_text(Page())
+
+
 def test_chunking_small_single_chunk():
     text = "hello world this is a short document"
     chunks = m.chunk_text(text, size=800, overlap=150)
@@ -201,15 +245,19 @@ def test_stale_index_rejection(tmp_path, monkeypatch):
     faiss.normalize_L2(vecs)
     idx = faiss.IndexFlatIP(stale_dim)
     idx.add(vecs)
-    faiss.write_index(idx, "fake.faissindex")
+    ocr_key = __import__("hashlib").sha256(b"auto:eng").hexdigest()[:10]
+    cache_name = f"fake_v{m.INDEX_PIPELINE_VERSION}_{ocr_key}"
+    faiss.write_index(idx, f"{cache_name}.faissindex")
     pd.DataFrame(
         [{"doc": "fake", "page": 1, "type": "text", "content": f"chunk {i}"} for i in range(3)]
-    ).to_parquet("fake.meta.parquet")
+    ).to_parquet(f"{cache_name}.meta.parquet")
 
     inst = m.VoiceRAGMultimodalFAISS.__new__(m.VoiceRAGMultimodalFAISS)
     inst.pdf_paths = [str(pdf)]
     inst.cache_dir = tmp_path
     inst.image_save_dir = tmp_path / "images"
+    inst.ocr_mode = "auto"
+    inst.ocr_languages = "eng"
     inst.client = mock.Mock()
     inst.faiss_index = None
     inst.metadata_db = None
@@ -217,7 +265,7 @@ def test_stale_index_rejection(tmp_path, monkeypatch):
 
     build_called = {"n": 0}
 
-    def fake_build(pdf_path_str, client, image_save_dir):
+    def fake_build(pdf_path_str, client, image_save_dir, *args):
         build_called["n"] += 1
         # Return a valid 1536-dim single-vector index build.
         emb = np.random.rand(m.EMBEDDING_DIM).astype("float32")
@@ -232,6 +280,6 @@ def test_stale_index_rejection(tmp_path, monkeypatch):
 
     # Stale index rejected + removed, rebuild invoked.
     assert build_called["n"] == 1
-    assert not Path("fake.faissindex").exists() or faiss.read_index("fake.faissindex").d == m.EMBEDDING_DIM
+    assert faiss.read_index(f"{cache_name}.faissindex").d == m.EMBEDDING_DIM
     assert inst.faiss_index is not None
     assert inst.faiss_index.d == m.EMBEDDING_DIM

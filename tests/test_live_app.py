@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pymupdf
 import numpy as np
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("OPENAI_API_KEY", "test-dummy-key")
@@ -51,7 +52,7 @@ def test_preference_update_validates_whole_request():
 
 
 def test_retrieval_returns_distinct_source_pages(monkeypatch):
-    from module_v2v_rag import retrieve_context_and_sources
+    from module_v2v_rag import retrieve_context_and_sources, retrieve_documents
     import module_v2v_rag as rag
 
     class FakeIndex:
@@ -70,6 +71,11 @@ def test_retrieval_returns_distinct_source_pages(monkeypatch):
     context, sources = retrieve_context_and_sources("diagram", FakeIndex(), rows, None, 2)
     assert [(source["doc"], source["page"]) for source in sources] == [("lesson", 5), ("lesson", 2)]
     assert "Pg 5" in context
+    detailed = retrieve_documents("diagram", FakeIndex(), rows, None, 2)
+    assert [(source["doc"], source["page"]) for source in detailed.candidates] == [
+        ("lesson", 2), ("lesson", 5),
+    ]
+    assert detailed.candidates[0]["score"] == pytest.approx(0.9)
 
 
 def test_source_page_is_previewed_and_validated(tmp_path, monkeypatch):
@@ -149,8 +155,9 @@ def test_realtime_relays_transcript_audio_and_turn_events(tmp_path):
     asyncio.run(live._from_openai(ws, FakeConnection(), session))
     assert ws.audio == [b"\x01\x00"]
     assert [event["type"] for event in ws.json_events if event["type"] != "sources"] == [
-        "speech_started", "speech_stopped", "transcript", "transcript", "turn_done",
+        "speech_started", "speech_stopped", "transcript", "transcript", "metrics", "turn_done",
     ]
+    assert session.metrics[0]["time_to_first_audio_ms"] >= 0
     assert session.browser.turns == [("Explain the page", "Here is the answer")]
 
 
@@ -161,9 +168,13 @@ def test_document_tool_searches_and_continues_spoken_response(tmp_path, monkeypa
 
     def fake_retrieve(query, *args):
         queries.append(query)
-        return "Source: lesson, Pg 1 - Study source", [{"doc": "lesson", "page": 1}]
+        from module_v2v_rag import RetrievalResult
+        return RetrievalResult(
+            "Source: lesson, Pg 1 - Study source",
+            passages=[{"doc": "lesson", "page": 1, "type": "text", "content": "Study source"}],
+        )
 
-    monkeypatch.setattr(live, "retrieve_context_and_sources", fake_retrieve)
+    monkeypatch.setattr(live, "retrieve_documents", fake_retrieve)
 
     class FakeWebSocket:
         def __init__(self):
@@ -212,9 +223,12 @@ def test_document_tool_searches_and_continues_spoken_response(tmp_path, monkeypa
     asyncio.run(live._from_openai(ws, conn, session))
     assert queries == ["study source"]
     assert conn.outputs[0]["type"] == "function_call_output"
+    assert "[S1]" in conn.outputs[0]["output"]
     assert conn.responses == [{"tool_choice": "none"}]
     assert session.browser.turns == [("Explain the page", "The page says study source.")]
     assert any(event["type"] == "sources" and event["sources"] for event in ws.events)
+    assert any(event["type"] == "sources" and event["sources"] and
+               event["sources"][0]["id"] == "S1" for event in ws.events)
 
 
 def test_quiz_answer_is_not_exposed_on_question_turn(tmp_path):

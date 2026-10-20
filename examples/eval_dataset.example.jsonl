@@ -1,1 +1,1 @@
-{"id":"sample-1","query":"What does the sample document say about cells?","expected_pages":[{"doc":"sample","page":1}]}
+{"id":"sample-1","query":"What does the sample document say about cells?","category":"fact","language":"en","expected_pages":[{"doc":"sample","page":1,"quote":"Cells have membranes"}]}

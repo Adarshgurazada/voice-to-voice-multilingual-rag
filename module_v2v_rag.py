@@ -4,7 +4,9 @@ import os
 import base64
 import json
 import io
+import hashlib
 import time  # For simple delays / backoff
+from dataclasses import dataclass, field
 import pandas as pd
 import pymupdf as fitz  # PyMuPDF for image extraction
 from PIL import Image as PIL_Image
@@ -44,6 +46,8 @@ except ImportError:
 # --- RAG Constants ---
 RAG_TEXT_CHUNK_SIZE = 800
 RAG_CHUNK_OVERLAP = 150
+INDEX_PIPELINE_VERSION = 2
+OCR_MIN_TEXT_CHARS = 40
 RAG_TOP_K = 5
 RAG_CANDIDATE_K = 20
 RERANK_TIMEOUT_S = 4.0
@@ -323,8 +327,27 @@ def _normalize_image(image_bytes: bytes, ext: str) -> tuple[bytes, str, str] | N
 
 
 # --- FAISS Index Building / Loading ---
+def extract_page_text(page, ocr_mode: str = "auto", ocr_languages: str = "eng") -> tuple[str, str]:
+    """OCR image-bearing pages with little selectable text; return text and origin."""
+    text = page.get_text("text") or ""
+    if ocr_mode == "off" or len("".join(text.split())) >= OCR_MIN_TEXT_CHARS:
+        return text, "text"
+    if not page.get_images(full=True):
+        return text, "text"
+    try:
+        textpage = page.get_textpage_ocr(language=ocr_languages, dpi=150, full=True)
+        ocr_text = page.get_text("text", textpage=textpage) or ""
+    except Exception as exc:
+        raise RuntimeError(
+            f"OCR failed. Install Tesseract and the requested language data "
+            f"({ocr_languages}); set TESSDATA_PREFIX to tessdata if needed: {exc}"
+        ) from exc
+    return (ocr_text, "ocr") if len(ocr_text.strip()) > len(text.strip()) else (text, "text")
+
+
 def build_or_load_index(
     pdf_path_str: str, client: OpenAI, image_save_dir: str, progress_callback=None,
+    ocr_mode: str = "auto", ocr_languages: str = "eng",
 ) -> tuple[list, list, int | None]:
     """Process a single PDF: extract text/images, embed, return metadata + embeddings.
 
@@ -370,7 +393,7 @@ def build_or_load_index(
             page_id = page_num + 1
             print(f"\r  - Processing page {page_id}/{num_pages}...", end="")
             # 1. Process Text
-            page_text = page.get_text("text")
+            page_text, text_type = extract_page_text(page, ocr_mode, ocr_languages)
             if page_text and not page_text.isspace():
                 for chunk in chunk_text(page_text):
                     if not chunk or chunk.isspace():
@@ -378,7 +401,7 @@ def build_or_load_index(
                     embedding = get_text_embedding(client, chunk)
                     _add_item(
                         embedding,
-                        {"doc": doc_basename, "page": page_id, "type": "text", "content": chunk},
+                        {"doc": doc_basename, "page": page_id, "type": text_type, "content": chunk},
                     )
 
             # 2. Process Images
@@ -429,6 +452,8 @@ def build_or_load_index(
             if progress_callback is not None:
                 progress_callback(page_id, num_pages)
         print()  # Newline after document
+    except RuntimeError:
+        raise
     except Exception as e:  # noqa: BLE001
         print(f"Error processing document {pdf_path_str}: {e}", file=sys.stderr)
 
@@ -530,10 +555,20 @@ def rerank_candidates(client: OpenAI, query: str, candidates: list[str], top_k: 
 
 
 # --- FAISS Retrieval ---
+@dataclass
+class RetrievalResult:
+    context: str
+    sources: list[dict] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    timings: dict[str, float] = field(default_factory=dict)
+    error: str | None = None
+    passages: list[dict] = field(default_factory=list)
+
+
 def _format_context(rows) -> str:
     context_parts = []
     for _, row in rows.iterrows():
-        if row["type"] == "text":
+        if row["type"] in ("text", "ocr"):
             context_parts.append(
                 f"[Text Context - Source: {row['doc']}, Pg {row['page']}]\n{row['content']}"
             )
@@ -547,43 +582,55 @@ def _format_context(rows) -> str:
     return "\n".join(context_parts)
 
 
-def retrieve_context_and_sources(
+def retrieve_documents(
     query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int
-) -> tuple[str, list[dict]]:
-    """Return grounded context and its source rows for voice and UI callers."""
+) -> RetrievalResult:
+    """Run the production retrieval path, retaining candidate ranks for evals."""
     print("Status: Finding relevant document context using FAISS...")
     if faiss_index is None or metadata_db is None or metadata_db.empty:
-        return "No document context available.", []
+        return RetrievalResult("No document context available.")
 
     try:
+        started = time.perf_counter()
         query_embedding = get_text_embedding(client, query)
         if query_embedding is None:
-            return "Could not process query embedding.", []
+            return RetrievalResult("Could not process query embedding.", error="embedding_failed")
+        embedding_seconds = time.perf_counter() - started
 
         query_embedding_np = np.array([query_embedding], dtype=np.float32)
         faiss.normalize_L2(query_embedding_np)
 
         k = min(RAG_CANDIDATE_K, faiss_index.ntotal)
         if k <= 0:
-            return "No relevant context found in documents.", []
+            return RetrievalResult("No relevant context found in documents.")
         print(f" - Searching FAISS index (k={k})...")
-        _, indices = faiss_index.search(query_embedding_np, k)
+        search_started = time.perf_counter()
+        scores, indices = faiss_index.search(query_embedding_np, k)
+        faiss_seconds = time.perf_counter() - search_started
 
         if indices.size == 0:
             print(" - No relevant items found in index.")
-            return "No relevant context found in documents.", []
+            return RetrievalResult("No relevant context found in documents.")
 
         retrieved_indices = indices[0]
-        retrieved_indices = retrieved_indices[retrieved_indices != -1]
+        valid = retrieved_indices != -1
+        retrieved_indices = retrieved_indices[valid]
         if len(retrieved_indices) == 0:
             print(" - No relevant items found in index (all results were invalid).")
-            return "No relevant context found in documents.", []
+            return RetrievalResult("No relevant context found in documents.")
 
         candidate_rows = metadata_db.iloc[retrieved_indices]
         candidate_texts = [str(c) for c in candidate_rows["content"].tolist()]
+        candidates = [
+            {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"]),
+             "score": float(score)}
+            for (_, row), score in zip(candidate_rows.iterrows(), scores[0][valid])
+        ]
 
         print(f" - Reranking {len(candidate_texts)} candidates -> top {top_k}...")
+        rerank_started = time.perf_counter()
         reranked = rerank_candidates(client, query, candidate_texts, top_k)
+        rerank_seconds = time.perf_counter() - rerank_started
         # Map reranked positions back to metadata rows.
         selected_positions = reranked[:top_k]
         selected_rows = candidate_rows.iloc[selected_positions]
@@ -593,11 +640,28 @@ def retrieve_context_and_sources(
             {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"])}
             for _, row in selected_rows.iterrows()
         ]
-        return _format_context(selected_rows), sources
+        passages = [
+            {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"]),
+             "content": str(row["content"])}
+            for _, row in selected_rows.iterrows()
+        ]
+        return RetrievalResult(
+            context=_format_context(selected_rows), sources=sources, candidates=candidates,
+            passages=passages, timings={"embedding_seconds": embedding_seconds,
+             "faiss_seconds": faiss_seconds, "rerank_seconds": rerank_seconds},
+        )
 
     except Exception as e:  # noqa: BLE001
         print(f"Error searching FAISS index: {e}", file=sys.stderr)
-        return "Error retrieving context from index.", []
+        return RetrievalResult("Error retrieving context from index.", error=str(e))
+
+
+def retrieve_context_and_sources(
+    query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int
+) -> tuple[str, list[dict]]:
+    """Compatibility wrapper used by the live voice tools and practice quiz."""
+    result = retrieve_documents(query, faiss_index, metadata_db, client, top_k)
+    return result.context, result.sources
 
 
 # --- Realtime session payload ---
@@ -653,10 +717,15 @@ class VoiceRAGMultimodalFAISS:
     def __init__(
         self, pdf_paths: list[str],
         cache_dir: str | Path = ".", image_save_dir: str | Path = IMAGE_SAVE_DIR,
+        ocr_mode: str = "auto", ocr_languages: str | None = None,
     ):
         self.pdf_paths = pdf_paths
         self.cache_dir = Path(cache_dir)
         self.image_save_dir = Path(image_save_dir)
+        if ocr_mode not in ("auto", "off"):
+            raise ValueError("ocr_mode must be 'auto' or 'off'")
+        self.ocr_mode = ocr_mode
+        self.ocr_languages = ocr_languages or os.getenv("OCR_LANGUAGES", "eng")
         self.faiss_index = None  # Combined FAISS index
         self.metadata_db = None  # Combined metadata DataFrame
         self.is_active = True
@@ -691,8 +760,10 @@ class VoiceRAGMultimodalFAISS:
 
         for pdf_path in self.pdf_paths:
             base_name = Path(pdf_path).stem
-            faiss_file = self.cache_dir / f"{base_name}{FAISS_INDEX_SUFFIX}"
-            meta_file = self.cache_dir / f"{base_name}{METADATA_SUFFIX}"
+            ocr_key = hashlib.sha256(f"{self.ocr_mode}:{self.ocr_languages}".encode()).hexdigest()[:10]
+            cache_name = f"{base_name}_v{INDEX_PIPELINE_VERSION}_{ocr_key}"
+            faiss_file = self.cache_dir / f"{cache_name}{FAISS_INDEX_SUFFIX}"
+            meta_file = self.cache_dir / f"{cache_name}{METADATA_SUFFIX}"
 
             if faiss_file.exists() and meta_file.exists():
                 print(f"Status: Loading existing index for {os.path.basename(pdf_path)}...")
@@ -767,7 +838,8 @@ class VoiceRAGMultimodalFAISS:
             print(f"Status: Building index for {os.path.basename(pdf_path)}...")
             if progress_callback is None:
                 meta_list, embeds_list, dim = await asyncio.to_thread(
-                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir)
+                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir),
+                    None, self.ocr_mode, self.ocr_languages,
                 )
             else:
                 loop = asyncio.get_running_loop()
@@ -776,7 +848,8 @@ class VoiceRAGMultimodalFAISS:
                     loop.call_soon_threadsafe(progress_callback, path, page, total)
 
                 meta_list, embeds_list, dim = await asyncio.to_thread(
-                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir), report_page
+                    build_or_load_index, pdf_path, self.client, str(self.image_save_dir),
+                    report_page, self.ocr_mode, self.ocr_languages,
                 )
 
             if not meta_list or not embeds_list or dim is None:

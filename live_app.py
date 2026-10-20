@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from config import REALTIME_MODEL_ID
+from citation_audit import audit_citations
 from glossary_mcp import lookup_glossary
 from voice_session import (
     AUTO_LANGUAGE,
@@ -33,7 +35,7 @@ from module_v2v_rag import (
     _event_response_id,
     _event_response_status,
     _extract_query,
-    retrieve_context_and_sources,
+    retrieve_documents,
 )
 from study_quiz import generate_quiz, grade_quiz
 
@@ -61,8 +63,13 @@ class LiveSession:
     voice_reconnect: bool = False
     current_question: str = ""
     current_answer: str = ""
+    current_answer_item_id: str = ""
     turn_sources: list[dict] = field(default_factory=list)
     quiz_started_this_turn: bool = False
+    speech_stopped_at: float | None = None
+    response_active: bool = False
+    turn_metrics: dict = field(default_factory=dict)
+    metrics: list[dict] = field(default_factory=list)
 
 
 sessions: dict[str, LiveSession] = {}
@@ -171,6 +178,12 @@ def session_status(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/metrics")
+def session_metrics(session_id: str):
+    session = _session_or_404(session_id)
+    return {"turns": session.metrics, "transport": "websocket", "clock": "server_monotonic"}
+
+
 @app.get("/api/sessions/{session_id}/pages/{doc}/{page}")
 def source_page(session_id: str, doc: str, page: int):
     session = _session_or_404(session_id)
@@ -185,16 +198,16 @@ def source_page(session_id: str, doc: str, page: int):
 
 
 async def _send_sources(ws: WebSocket, session: LiveSession) -> None:
-    seen = set()
     sources = []
     for source in session.turn_sources:
         doc, page = source["doc"], source["page"]
-        if (doc, page) in seen or doc not in session.browser.documents:
+        if doc not in session.browser.documents:
             continue
-        seen.add((doc, page))
         sources.append({
+            "id": source.get("id"),
             "label": f"{session.browser.display_names[doc]} - page {page}",
             "url": f"/api/sessions/{session.id}/pages/{quote(doc, safe='')}/{page}",
+            "excerpt": source.get("content", "")[:500],
         })
     await ws.send_json({"type": "sources", "sources": sources})
 
@@ -213,12 +226,23 @@ async def _run_tool(session: LiveSession, name: str, args: dict, transcript: str
         query = _extract_query(json.dumps(args), transcript)
         if not query:
             return json.dumps({"status": "no_question"})
-        context, sources = await asyncio.to_thread(
-            retrieve_context_and_sources,
+        retrieval = await asyncio.to_thread(
+            retrieve_documents,
             query, engine.faiss_index, engine.metadata_db, engine.client, RAG_TOP_K,
         )
-        session.turn_sources.extend(sources)
-        return context
+        if retrieval.error:
+            return f"Document search failed: {retrieval.error}"
+        if not retrieval.passages:
+            return retrieval.context
+        context = []
+        for passage in retrieval.passages:
+            source_id = f"S{len(session.turn_sources) + 1}"
+            session.turn_sources.append({**passage, "id": source_id})
+            context.append(
+                f"[{source_id}] {passage['doc']}, page {passage['page']}, "
+                f"{passage['type']} passage:\n{passage['content']}"
+            )
+        return "\n---\n".join(context)
     if name == "set_preferences":
         language, voice, output = _apply_preference_update(
             args, browser.language_preference, browser.selected_voice,
@@ -294,21 +318,43 @@ async def _from_browser(ws: WebSocket, conn) -> None:
         await conn.input_audio_buffer.append(audio=base64.b64encode(audio).decode("ascii"))
 
 
+async def _send_citation_audit(ws: WebSocket, session: LiveSession, answer: str,
+                               item_id: str, passages: list[dict]) -> None:
+    try:
+        spans = await asyncio.to_thread(
+            audit_citations, session.browser.engine.client, answer, passages,
+        )
+        await ws.send_json({"type": "citations", "item_id": item_id, "spans": spans})
+    except Exception as exc:
+        print(f"Citation audit unavailable: {exc}")
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "citations", "item_id": item_id, "spans": [],
+                                "status": "unavailable"})
+
+
 async def _from_openai(ws: WebSocket, conn, session: LiveSession) -> None:
     calls_by_response: dict[str, set[str]] = {}
+    citation_tasks: set[asyncio.Task] = set()
     active_response_id = ""
-    async for event in conn:
+    try:
+      async for event in conn:
         kind = getattr(event, "type", "")
         if kind == "error":
             raise RuntimeError(str(getattr(event, "error", event)))
         if kind == "response.created":
             active_response_id = _event_response_id(event) or ""
+            session.response_active = True
         elif kind == "input_audio_buffer.speech_started":
+            if session.response_active:
+                session.turn_metrics["interrupted_previous_response"] = True
             session.turn_sources.clear()
             session.quiz_started_this_turn = False
+            session.turn_metrics = {"interrupted_previous_response": session.response_active}
+            session.speech_stopped_at = None
             await ws.send_json({"type": "speech_started"})
             await _send_sources(ws, session)
         elif kind == "input_audio_buffer.speech_stopped":
+            session.speech_stopped_at = time.perf_counter()
             await ws.send_json({"type": "speech_stopped"})
         elif kind == "conversation.item.input_audio_transcription.delta":
             await ws.send_json({
@@ -348,6 +394,10 @@ async def _from_openai(ws: WebSocket, conn, session: LiveSession) -> None:
             })
         elif kind == "response.output_audio.delta":
             session.audio_emitted = True
+            if "time_to_first_audio_ms" not in session.turn_metrics and session.speech_stopped_at is not None:
+                session.turn_metrics["time_to_first_audio_ms"] = round(
+                    (time.perf_counter() - session.speech_stopped_at) * 1000, 1,
+                )
             await ws.send_bytes(base64.b64decode(getattr(event, "delta", "")))
         elif kind == "response.output_audio_transcript.delta":
             delta = getattr(event, "delta", "") or ""
@@ -358,17 +408,20 @@ async def _from_openai(ws: WebSocket, conn, session: LiveSession) -> None:
             })
         elif kind == "response.output_audio_transcript.done":
             session.current_answer = getattr(event, "transcript", "") or session.current_answer
+            session.current_answer_item_id = getattr(event, "item_id", "") or ""
             await ws.send_json({
                 "type": "transcript", "speaker": "assistant", "item_id": getattr(event, "item_id", ""),
                 "text": session.current_answer, "final": True,
             })
         elif kind == "response.done":
+            session.response_active = False
             response_id = _event_response_id(event) or active_response_id
             status = _event_response_status(event)
             calls = calls_by_response.pop(response_id, set())
             if status and status not in ("completed", "cancelled"):
                 raise RuntimeError(f"Realtime response failed ({status}).")
             if status == "cancelled":
+                session.turn_metrics["cancelled_response"] = True
                 session.current_question = ""
                 session.current_answer = ""
                 session.quiz_started_this_turn = False
@@ -376,16 +429,33 @@ async def _from_openai(ws: WebSocket, conn, session: LiveSession) -> None:
             elif status == "completed" and calls:
                 await conn.response.create(response={"tool_choice": "none"})
             elif not calls:
+                if session.current_answer and any(source.get("id") for source in session.turn_sources):
+                    task = asyncio.create_task(_send_citation_audit(
+                        ws, session, session.current_answer, session.current_answer_item_id,
+                        list(session.turn_sources),
+                    ))
+                    citation_tasks.add(task)
+                    task.add_done_callback(citation_tasks.discard)
+                session.turn_metrics["transcription_missing"] = not bool(session.current_question)
+                session.turn_metrics["answer_audio_missing"] = "time_to_first_audio_ms" not in session.turn_metrics
+                session.metrics.append(dict(session.turn_metrics))
+                await ws.send_json({"type": "metrics", "metrics": session.turn_metrics})
                 if session.current_question and session.current_answer:
                     session.browser.turns.append((session.current_question, session.current_answer))
                 session.current_question = ""
                 session.current_answer = ""
+                session.current_answer_item_id = ""
                 session.quiz_started_this_turn = False
                 await ws.send_json({"type": "turn_done"})
                 if session.voice_reconnect:
                     session.voice_reconnect = False
                     await ws.send_json({"type": "reconnect"})
                     return
+    finally:
+        for task in citation_tasks:
+            task.cancel()
+        if citation_tasks:
+            await asyncio.gather(*citation_tasks, return_exceptions=True)
 
 
 @app.websocket("/ws/{session_id}")

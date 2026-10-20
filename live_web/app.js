@@ -14,6 +14,35 @@ let reconnecting = false;
 let nextAudioTime = 0;
 const playing = new Set();
 const transcriptRows = new Map();
+const sourceButtons = new Map();
+let currentSources = [];
+
+function renderCitations(row, answer, spans) {
+  const content = row.querySelector("p");
+  content.replaceChildren();
+  let start = 0;
+  for (const span of spans) {
+    if (span.start < start || span.end > answer.length || span.end <= span.start) continue;
+    content.append(document.createTextNode(answer.slice(start, span.end)));
+    const source = (row._sources || []).find((item) => item.id === span.source_id);
+    if (source) {
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "citation-link";
+      link.textContent = `[${span.source_id}]`;
+      link.title = `${source.label}: ${span.evidence_quote}`;
+      link.onclick = () => {
+        showSources(row._sources);
+        sourceButtons.get(span.source_id)?.click();
+      };
+      content.append(link);
+    } else {
+      content.append(document.createTextNode(` [${span.source_id}]`));
+    }
+    start = span.end;
+  }
+  content.append(document.createTextNode(answer.slice(start)));
+}
 
 function state(label, online = false) {
   $("call-state").textContent = label;
@@ -64,7 +93,9 @@ function addTranscript(event) {
   }
   const content = row.querySelector("p");
   if (event.final) {
-    content.textContent = event.text || content.textContent;
+    const finalText = event.text || content.textContent;
+    content.textContent = finalText;
+    if (event.speaker === "assistant") row._sources = [...currentSources];
     row.classList.remove("partial");
   } else {
     content.textContent += event.delta || "";
@@ -73,24 +104,31 @@ function addTranscript(event) {
 }
 
 function showSources(sources) {
+  currentSources = [...sources];
   const container = $("sources");
   container.replaceChildren();
+  sourceButtons.clear();
   const image = $("page-image");
   image.hidden = true;
   image.removeAttribute("src");
   for (const source of sources) {
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = source.label;
+    button.textContent = source.id ? `${source.id} · ${source.label}` : source.label;
+    button.dataset.label = source.label;
+    button.title = source.excerpt || source.label;
+    if (source.id) sourceButtons.set(source.id, button);
     button.onclick = () => {
       for (const other of container.querySelectorAll("button")) other.classList.remove("active");
       button.classList.add("active");
       image.src = source.url;
       image.hidden = false;
+      $("source-excerpt").textContent = source.excerpt || "";
     };
     container.append(button);
   }
   if (container.firstChild) container.firstChild.click();
+  else $("source-excerpt").textContent = "";
 }
 
 function handleServer(event) {
@@ -106,6 +144,12 @@ function handleServer(event) {
     addTranscript(event);
   } else if (event.type === "sources") {
     showSources(event.sources || []);
+  } else if (event.type === "citations") {
+    const row = transcriptRows.get(`assistant:${event.item_id || "current"}`);
+    if (row && event.spans?.length) renderCitations(row, row.querySelector("p").textContent, event.spans);
+  } else if (event.type === "metrics") {
+    const value = event.metrics.time_to_first_audio_ms;
+    $("voice-metrics").textContent = value == null ? "No response audio" : `First audio ${value} ms`;
   } else if (event.type === "turn_done") {
     state("Listening", true);
     transcriptRows.delete("user:current");
