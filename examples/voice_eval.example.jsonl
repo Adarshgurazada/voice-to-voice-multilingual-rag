@@ -1,0 +1,2 @@
+{"id":"turn-1","reference_transcript":"What is photosynthesis","transcript":"What is photosynthesis","expected_language":"en","actual_language":"en","turn_detection_error":false,"interrupted_previous_response":false,"time_to_first_audio_ms":850}
+{"id":"turn-2","reference_transcript":"Explain it in Hindi","transcript":"Explain in Hindi","expected_language":"hi","actual_language":"hi","turn_detection_error":false,"interrupted_previous_response":true,"time_to_first_audio_ms":1050}
