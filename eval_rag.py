@@ -45,7 +45,14 @@ def load_cases(path: Path, document_stems: set[str]) -> list[dict]:
             if len(page_keys) != len(expected):
                 raise ValueError(f"Line {line_number}: duplicate expected page.")
             seen_ids.add(case_id)
+            history = case.get("history")
+            if history is not None and (not isinstance(history, list) or any(
+                    not isinstance(t, dict) or not isinstance(t.get("q"), str) or not isinstance(t.get("a"), str)
+                    for t in history)):
+                raise ValueError(f"Line {line_number}: history must be a list of {{q, a}} turns.")
             labeled = {"id": case_id, "query": query, "expected_pages": expected}
+            if history:
+                labeled["history"] = history
             for key in ("category", "language"):
                 if key in case:
                     if not isinstance(case[key], str) or not case[key].strip():
@@ -212,6 +219,7 @@ def index_cache(pdf_paths: list[Path], ocr_mode: str) -> tuple[str, list[dict], 
 
 async def run_retrieval(
     cases: list[dict], pdf_paths: list[Path], ocr_mode: str = "auto", expand: bool = True,
+    hybrid: bool = True, rewrite: bool = True,
 ) -> dict:
     from config import EMBEDDING_MODEL_ID, RERANK_MODEL_ID, VISION_MODEL_ID
     from module_v2v_rag import (
@@ -244,10 +252,11 @@ async def run_retrieval(
         results = []
         for case in cases:
             started = time.perf_counter()
+            turns = [(t["q"], t["a"]) for t in case.get("history", [])]
             retrieval = await asyncio.to_thread(
                 retrieve_documents,
                 case["query"], engine.faiss_index, engine.metadata_db, engine.client, RAG_TOP_K,
-                expand,
+                expand, None, False, case["query"] if turns else "", turns or None, hybrid, rewrite,
             )
             if retrieval.error:
                 raise RuntimeError(f"Retrieval failed for case {case['id']}: {retrieval.error}")
@@ -268,6 +277,8 @@ async def run_retrieval(
                 "index_fingerprint": fingerprint,
                 "ocr_mode": ocr_mode,
                 "query_expansion": expand,
+                "hybrid_search": hybrid,
+                "followup_rewrite": rewrite,
                 "indexed_ocr_pages": len({
                     (str(row["doc"]), int(row["page"]))
                     for _, row in engine.metadata_db[engine.metadata_db["type"].isin(["ocr", "vision"])].iterrows()
@@ -295,6 +306,8 @@ def main() -> int:
                         help="Read low-text image pages with Tesseract (auto), the vision model, or not at all")
     parser.add_argument("--no-expand", action="store_true",
                         help="Disable English query expansion (ablation baseline)")
+    parser.add_argument("--no-hybrid", action="store_true", help="Dense search only (no BM25 keyword fusion)")
+    parser.add_argument("--no-rewrite", action="store_true", help="Do not rewrite follow-up questions from history")
     args = parser.parse_args()
 
     try:
@@ -325,7 +338,8 @@ def main() -> int:
             from module_v2v_rag import RAG_TOP_K
             if baseline.get("configuration", {}).get("top_k") != RAG_TOP_K:
                 raise ValueError("Baseline and current top_k must match.")
-        report = asyncio.run(run_retrieval(cases, pdf_paths, args.ocr, not args.no_expand))
+        report = asyncio.run(run_retrieval(cases, pdf_paths, args.ocr, not args.no_expand,
+                                           not args.no_hybrid, not args.no_rewrite))
         report["inputs"]["dataset_sha256"] = dataset_hash
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

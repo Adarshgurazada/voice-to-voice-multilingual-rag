@@ -381,3 +381,78 @@ def test_vision_mode_uses_transcript_and_falls_back_to_ocr(monkeypatch):
     monkeypatch.setattr(rag, "transcribe_page_with_vision", lambda client, page: None)
     text, kind = rag.extract_page_text(Page(), "vision", "eng", client=object())
     assert kind == "ocr" and text.startswith("OCR TEXT")
+
+
+def _sectioned_frame():
+    import pandas as pd
+    sections = ["Part D › SECTION 17 · Objection handling"] * 6 + ["Part B › SECTION 3 · Product"] * 3
+    return pd.DataFrame({
+        "doc": ["pb"] * 9, "page": [47] * 6 + [9] * 3, "type": ["text"] * 9,
+        "content": [f"Objection: reply {i}" for i in range(6)] + ["Brandel records calls.", "It drafts email.", "More."],
+        "section": sections, "seq": list(range(9)), "kind": ["row"] * 6 + ["text"] * 3,
+    })
+
+
+def test_section_title_ranking_matches_stems_not_exact_words():
+    from module_v2v_rag import section_title_ranking
+    frame = _sectioned_frame()
+    assert section_title_ranking("Tell me all the objections", frame) == [0, 1, 2, 3, 4, 5]
+    assert section_title_ranking("what does it cost", frame) == []
+
+
+def test_list_questions_pull_in_the_whole_section():
+    from module_v2v_rag import expand_context
+    extra = expand_context(_sectioned_frame(), [1, 2], "Tell me all the objections")
+    assert sorted(extra) == [0, 3, 4, 5]  # everything else in Section 17, nothing from other sections
+
+
+def test_other_questions_add_only_neighbours_in_the_same_section():
+    from module_v2v_rag import expand_context
+    assert sorted(expand_context(_sectioned_frame(), [7], "What does Brandel do?")) == [6, 8]
+    # Position 5 is the end of its section: the chunk after it belongs to another section and is skipped.
+    assert 6 not in expand_context(_sectioned_frame(), [5], "How should I reply?")
+
+
+def test_expansion_is_skipped_for_indexes_without_structure():
+    import pandas as pd
+    from module_v2v_rag import expand_context
+    plain = pd.DataFrame({"doc": ["a"], "page": [1], "type": ["text"], "content": ["x"]})
+    assert expand_context(plain, [0], "all of it") == []
+
+
+def test_voice_model_or_heard_words_can_ask_for_the_whole_section():
+    """A rewritten search query like "objections" loses the learner's "all"; the signal must still get through."""
+    import pandas as pd
+    from module_v2v_rag import retrieve_documents
+
+    frame = _sectioned_frame()
+
+    class Index:
+        ntotal = len(frame)
+
+        def search(self, matrix, k):
+            import numpy as np
+            return np.array([[0.9, 0.8]], dtype="float32"), np.array([[1, 2]])
+
+    class Client:
+        pass
+
+    import module_v2v_rag as mod
+    original = (mod.get_text_embeddings, mod.rerank_candidates, mod.expand_query)
+    mod.get_text_embeddings = lambda client, texts: [[0.1] * 4 for _ in texts]
+    mod.rerank_candidates = lambda client, query, texts, top_k: list(range(min(top_k, len(texts))))
+    mod.expand_query = lambda client, query: [query]
+    try:
+        plain = retrieve_documents("objections", Index(), frame, Client(), 2)
+        by_flag = retrieve_documents("objections", Index(), frame, Client(), 2, covers_all=True)
+        by_words = retrieve_documents("objections", Index(), frame, Client(), 2, question_hint="Tell me all the objections")
+    finally:
+        mod.get_text_embeddings, mod.rerank_candidates, mod.expand_query = original
+    assert sum(p["expanded"] for p in by_flag.passages) >= 4 and sum(p["expanded"] for p in by_words.passages) >= 4
+    assert sum(p["expanded"] for p in plain.passages) <= 3  # only neighbours without the signal
+
+
+def test_walk_me_through_is_not_a_list_request():
+    from module_v2v_rag import _ENUMERATION
+    assert not _ENUMERATION.search("Walk me through how to handle the pricing objection and explain why")
+    assert _ENUMERATION.search("Tell me all the objections") and _ENUMERATION.search("What are the steps?")

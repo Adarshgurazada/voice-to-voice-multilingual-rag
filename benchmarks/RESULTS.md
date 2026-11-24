@@ -74,6 +74,55 @@ Findings:
   "corrects" OCR typos inside its quote (e.g. `7imaeus` for `Timaeus`) or the Telugu OCR is garbled.
 - Added latency of the support stage: about +0.7 s per answer (1.2 s to 1.9–2.1 s).
 
+## 3. Hybrid keyword search and follow-up rewriting
+
+Two retrieval changes, each switchable for measurement: BM25 keyword search fused with the embedding search
+(`--no-hybrid` turns it off) and rewriting of follow-up questions from the last three turns (`--no-rewrite`).
+**Neither was tuned on these sets**; the defaults were chosen before running them.
+
+Reproduce (needs `OPENAI_API_KEY`; the same four PDFs as above):
+
+```bash
+OCR_LANGUAGES=eng+tel+hin+ben python eval_rag.py --dataset benchmarks/dev_local.jsonl \
+  --pdf docs/plato.pdf --pdf docs/telugu.pdf --pdf docs/hindi.pdf --pdf docs/bengali.pdf [--no-hybrid]
+OCR_LANGUAGES=eng+tel+hin+ben python eval_rag.py --dataset benchmarks/followups_dev_local.jsonl \
+  --pdf docs/plato.pdf --pdf docs/telugu.pdf --pdf docs/hindi.pdf --pdf docs/bengali.pdf [--no-hybrid] [--no-rewrite]
+```
+
+**Hybrid search, original 32 questions** (3 runs each; mean, with the range in brackets). These runs use the
+current index version, so they are not comparable with the numbers in section 1.
+
+| Configuration | Candidate recall | Reranked Hit@1 | Hit@3 | Hit@5 | MRR@5 | Seconds per query |
+|---|---|---|---|---|---|---|
+| Dense (embeddings) only | 0.979 | **0.823** (0.81-0.84) | 0.927 (0.91-0.94) | 0.958 (0.94-0.97) | 0.882 (0.87-0.90) | 1.71 |
+| Dense + BM25 (hybrid) | **0.990** | 0.792 (0.75-0.81) | **0.990** (0.97-1.00) | **0.990** (0.97-1.00) | 0.891 (0.86-0.91) | 1.68 |
+
+Hybrid search finds the labelled page more often within the first three or five results (+0.06 at Hit@3,
++0.03 at Hit@5) and costs no measurable time. It does **not** improve the top-ranked result: Hit@1 is about
+one question lower, and the ranges overlap. The answer step reads all five reranked passages, so Hit@5 is
+the number that matters most for answers; but this is one question set, and the Hit@1 loss is real.
+
+**Follow-up rewriting, 12 follow-up questions with conversation history** (2-3 runs each). Examples:
+"Which village was he from?" after a question about Potana; "And how about the crocodile?" after a question
+about the tortoise.
+
+| Configuration | Candidate recall | Hit@1 | Hit@3 | Hit@5 | MRR@5 |
+|---|---|---|---|---|---|
+| Dense, no rewrite | 0.917 | 0.833 | 0.833 | 0.833 | 0.833 |
+| **Dense + rewrite** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| Hybrid, no rewrite | 0.917 | 0.694 (0.67-0.75) | 0.833 | 0.833 | 0.755 |
+| Hybrid + rewrite | 1.000 | 0.889 (0.75-1.00) | 0.972 (0.92-1.00) | 1.000 | 0.936 (0.88-1.00) |
+
+- **Rewriting is the clear win.** It fixed the cases where a pronoun hid the subject: "Which village was he
+  from?" and "What are his parents called?" searched the Plato PDF without the history and found the right
+  Telugu page with it. It costs about one second, only on messages that look like follow-ups.
+- **Hybrid search hurts context-free follow-ups.** Without a rewrite, a vague message like "Which village was
+  he from?" gives BM25 only generic words, and Hit@1 falls from 0.833 to 0.694. With the rewrite the keyword
+  search gets real terms and the gap closes (0.889 against 1.000 for dense + rewrite at Hit@1, equal at Hit@5).
+- **Caveats.** 12 conversations written by one person with an AI assistant from facts already in the labelled
+  set, one document family, and LLM reranking that varies run to run. Differences of one question are 8 points
+  here. Treat the direction as the finding, not the decimals.
+
 ## Not yet measured
 
 Spoken input and output (word error rate, turn detection, time to first audio in the live app), the

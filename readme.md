@@ -16,12 +16,13 @@ the evaluation harness and measured results that show how often that holds.
    speech-out with server-side voice-activity detection, so you can interrupt it mid-sentence.
 3. **The assistant searches your documents through a tool call** before it answers. Retrieved pages
    appear next to the live transcript, with excerpts and page previews.
-4. **Answer language follows the language you spoke.** It is decided from the script of the
-   transcript, not from the voice model's guess.
+4. **Answer language is yours to control.** The *Answer language* dropdown defaults to **Auto**,
+   which follows the language you speak (decided from the script of the transcript, not the voice
+   model's guess). Pick a language and answers stay in it, however you speak; saying "answer in
+   Hindi" does the same and updates the dropdown.
 
-Separately, a text pipeline (`grounded_answer.py`) answers with claim-level citations and a
-fail-closed verifier. It is evaluated end to end in this repo but is **not yet wired into the live
-voice path** (see [Roadmap](#roadmap)).
+The spoken answer is built from claims that passed the grounded-answer verifier
+(`grounded_answer.py`, see [Architecture](#architecture)), not from raw passages.
 
 ## Architecture
 
@@ -29,7 +30,7 @@ voice path** (see [Roadmap](#roadmap)).
 flowchart LR
     subgraph Ingest["Indexing (per PDF, cached)"]
         P[PDF] --> T{Text layer?}
-        T -- yes --> C[Chunk 800 chars / 150 overlap]
+        T -- yes --> C[Section-aware chunks<br/>headings, table rows, sentences]
         T -- no --> O[Tesseract OCR<br/>or vision-model page read]
         O --> C
         P --> I[Embedded images -> vision captions]
@@ -39,11 +40,16 @@ flowchart LR
     end
 
     subgraph Retrieve["Retrieval"]
-        Q[Question] --> X{Non-English?}
+        Q[Question] --> FU{Follow-up?}
+        FU -- yes --> RW[Rewrite from the last turns]
+        FU -- no --> X
+        RW --> X{Non-English?}
         X -- yes --> TR[English translation]
         X -- no --> S
         TR --> S[Search original + English<br/>top 20 each]
+        X -.-> BM[BM25 keyword search]
         S --> RRF[Reciprocal-rank fusion]
+        BM --> RRF
         RRF --> RR[LLM rerank -> top 5]
     end
 
@@ -65,7 +71,7 @@ Key design points:
 - **Server-side tools.** The browser never sees the API key; the server runs retrieval and sends
   results back to the Realtime session. A failing tool returns an error to the model instead of
   ending the call.
-- **Two-stage retrieval.** Dense search over-fetches 20 candidates; an LLM reranker picks the final
+- **Two-stage retrieval.** Dense search (fused with BM25 keyword search) over-fetches 20 candidates; an LLM reranker picks the final
   5 with strict output validation and a FAISS-order fallback on timeout (single 4 s deadline).
 - **Cross-language bridge.** Dense retrievers favour same-language passages, so a Hindi question can
   miss the English page that answers it. Non-English queries are also translated to English, both
@@ -74,10 +80,12 @@ Key design points:
   called its tool, so the server waits (bounded, overlapped with retrieval) for it and maps its
   writing system to a language. This replaced trusting the voice model's own guess, which once
   answered Telugu in Malayalam.
-- **Receipts.** Retrieved passages carry source IDs and page numbers to the UI. A post-hoc citation
-  auditor links answer spans to exact quotes. The text pipeline goes further (below).
+- **Receipts.** `search_documents` runs the grounded answer pipeline (below) and gives the voice
+  model only claims whose quotes were verified in the cited passage (or a fixed "not found"). The UI
+  shows only those verified sources, and a post-hoc citation auditor links the spoken answer to
+  exact quotes. The model's wording is still its own: see Limitations.
 
-### Grounded answer pipeline (text, evaluated)
+### Grounded answer pipeline (evaluated on text, used in the voice path)
 
 `grounded_answer.py` turns retrieved passages into an answer that can be audited:
 
@@ -89,6 +97,36 @@ Key design points:
    into English in 1804" claim carried a real quote from an unrelated passage.
 4. The final answer is **rebuilt from verified claims only**. If none survive, the answer is a fixed
    "I couldn't find that in your documents" in the question's language (en/te/hi/bn).
+
+### Study-companion layer
+
+The goal is a companion that explains what a document means, not one that reads passages back.
+
+- **Section-aware index** (`doc_structure.py`). The PDF layout (positions, font sizes, boldness) is read to
+  drop repeated headers and footers, build a section path such as
+  `PART 2 · Selling › SECTION 5 · Handling objections`, split at sentence boundaries, and turn
+  unruled tables into one chunk per row keyed by the column headings (including a "what it often means"
+  column, which is where the intent lives). The section path is embedded with every chunk and shown next to
+  every source.
+- **Retrieval that reaches the whole answer.** Section titles are matched against the question, and
+  list-style questions ("all the objections", asked by the voice model or heard) pull in the whole matching
+  section; other questions add the neighbouring chunks. The learner's own words are searched as well as the
+  model's often terse query.
+- **Hybrid search and follow-ups.** BM25 keyword search (`lexical_search.py`) is fused with the embedding
+  search, and a message like "which village was he from?" is rewritten into a standalone question from the
+  last three turns before searching (`HYBRID_SEARCH`, `FOLLOWUP_REWRITE`). Measured effects are in
+  `benchmarks/RESULTS.md`: rewriting fixed every follow-up that lost its subject; hybrid search raised
+  Hit@3 from 0.93 to 0.99 but not Hit@1.
+- **Evidence cards.** Every verified claim becomes a card with its role (answer, definition, step, why,
+  example, caution), the exact quote, where it sits in the document, and the page image with that quote
+  highlighted (`highlight.py`). The companion's own plain-words reading, when it passes the check, is shown in a
+  separate dashed card labelled as not quoted from the document.
+- **Teaching-style answers** (`grounded_answer.py`). Every verified claim has a role (answer, definition,
+  step, reason, example, caution) and the lesson follows that order. A reason is only spoken when the
+  document states it; otherwise the companion says the document does not. An optional "in plain words"
+  reading is used only if a second check finds that it adds no fact, number, name, step or reason.
+- **Depth.** A brief reply gives the direct answer and the few points that matter, and offers more; a
+  detailed reply ("explain", "why", "step by step") walks through the steps and their reasons.
 
 ## Results
 
@@ -140,6 +178,23 @@ What I take from it:
 - **OCR noise causes false abstentions.** The model "corrects" typos (e.g. `7imaeus` to `Timaeus`)
   inside its quote, and Telugu OCR is often garbled.
 - The support check adds about 0.7 s per answer.
+
+### Section-aware index on a private 66-page sales playbook
+
+The playbook cannot be shared, so this is a local check, not a benchmark. Same questions, same retrieval
+code, old plain-chunk index versus the new one. "Found" counts how many expected facts reach the answer step.
+
+| Question | Index | Passages | Characters | Passages starting with the page header | Expected facts found |
+|---|---|---|---|---|---|
+| List: all the objections (and what each means) | plain chunks | 5 | 3,984 | 3 of 5 | 13 of 24 |
+| | **section-aware** | 12 | 3,569 | **0 of 12** | **22 of 24** |
+| Explain one objection and why | plain chunks | 5 | 3,988 | 3 of 5 | 5 of 5 |
+| | section-aware | 7 | 2,424 | 0 of 7 | 5 of 5 |
+| Fact: is our data safe? | plain chunks | 5 | 3,979 | 1 of 5 | 5 of 5 |
+| | section-aware | 7 | 1,875 | 0 of 7 | 5 of 5 |
+
+The gain is on list questions; for single-fact questions coverage is unchanged but the context is 40-50%
+smaller. Three questions, one document, one run each: treat it as a sanity check.
 
 ### Not yet measured
 
@@ -226,12 +281,16 @@ passage), unsupported shipped claims, answer-language match (by script), and lat
 
 | Setting | Where | Default |
 |---|---|---|
-| Realtime voice model | `config.py` `REALTIME_MODEL_ID` | `gpt-realtime-mini` |
+| Realtime voice model | `config.py` `REALTIME_MODEL_ID` | `gpt-realtime-2.1-mini` |
 | Embeddings | `EMBEDDING_MODEL_ID` | `text-embedding-3-small` (1536-dim) |
 | Vision captions, rerank, quiz | `VISION_MODEL_ID`, `RERANK_MODEL_ID`, `QUIZ_MODEL_ID` | `gpt-5.4-mini` |
 | Answer drafting and in-pipeline support check | `ANSWER_MODEL_ID`, `SUPPORT_MODEL_ID` | `gpt-5.4-mini` |
 | Evaluation judge (independent of the pipeline) | `JUDGE_MODEL_ID` | `gpt-5.5` |
 | Transcription | `TRANSCRIBE_MODEL_ID` | `gpt-4o-mini-transcribe` |
+| Verified voice answers | `GROUNDED_VOICE` env | `1` (set `0` to give the voice model raw passages) |
+| Hybrid search, follow-up rewriting | `HYBRID_SEARCH`, `FOLLOWUP_REWRITE` env | both on (`0` turns one off) |
+| Live transcript preview | `LIVE_TRANSCRIPT_PREVIEW`, `LIVE_PREVIEW_MODEL_ID` env | on, `gpt-realtime-whisper` |
+| Answer drafting model | `ANSWER_MODEL_ID` env | `gpt-5.4-mini` |
 | Retrieval | `module_v2v_rag.py` | 20 candidates, top 5, 800-char chunks, 150 overlap |
 | OCR languages | `OCR_LANGUAGES` env | `eng` |
 
@@ -242,7 +301,11 @@ live_app.py            FastAPI server: uploads, WebSocket voice loop, tools, tur
 voice_session.py       Session state, Realtime tool schemas, language detection by script
 module_v2v_rag.py      PDF reading (text/OCR/vision), chunking, batched embeddings, FAISS,
                        query expansion, reciprocal-rank fusion, LLM reranking
-grounded_answer.py     Claim + quote answers, quote verifier, support check, abstention
+doc_structure.py       Layout reading: headers, headings, section paths, table rows, sentence chunks
+lexical_search.py      BM25 keyword search fused with the embedding search
+highlight.py           Locate a verified quote on its page for the evidence cards
+vocabulary.py          Document terms for transcription hints and spelling repair
+grounded_answer.py     Claim + quote answers with roles, quote verifier, support and explanation checks
 citation_audit.py      Post-hoc claim-to-quote spans for the live transcript
 eval_rag.py            Retrieval benchmark (FAISS vs reranked, ablation flags)
 eval_answers.py        Answer-level grounding / abstention / correctness benchmark
@@ -251,24 +314,40 @@ study_quiz.py, study_mcp.py, glossary_mcp.py, study_glossary.json
                        Voice quiz, and a small local MCP glossary tool (see Limitations)
 live_web/              Browser UI (AudioWorklet mic streaming, transcript, sources)
 benchmarks/            Development datasets and RESULTS.md
-tests/                 77 offline tests (no network or API key needed)
+tests/                 155 offline tests (no network or API key needed)
 ```
 
 ## Tests and CI
 
 ```bash
-python -m pytest -q          # 77 tests, offline, runs without OPENAI_API_KEY
+python -m pytest -q          # 155 tests, offline, runs without OPENAI_API_KEY
 ```
 
 GitHub Actions runs the same suite on every push (`.github/workflows/ci.yml`).
 
 ## Limitations
 
+- **Structure reading is heuristic.** Headings, running headers and tables are recovered from font sizes
+  and positions. It worked on the one document it was tuned on (a designed, text-layer PDF) and is covered
+  by synthetic tests, but other layouts (multi-column articles, scanned pages) fall back to plain chunking.
+- **Roles and the plain-words reading come from a small model.** Roles are sometimes mislabelled, and
+  the explanation check is deliberately strict, so the plain-words line is often absent.
+- **A brief spoken reply is given only the first few verified claims** so the voice model does not read
+  everything out; the rest is available on request.
+- **The live voice path was exercised by replaying recorded speech and browser events, and by hand,
+  not by an automated microphone test.** Transcription hints can occasionally be echoed back by the
+  transcription model on silence; those transcripts are detected and ignored.
 - **The evaluation is small and self-labeled.** 32 questions, one labeler, single runs. One question
   is about 3 points of retrieval accuracy; many differences above are one or two questions.
 - **The LLM judge is uncalibrated** and I have not yet compared it with human labels.
-- **The live voice path is not yet protected by the verifier.** It relies on prompt instructions plus
-  a post-hoc citation audit, so an unsupported sentence can be spoken before it is flagged.
+- **The verifier protects what the voice model is *given*, not what it says.** `search_documents`
+  returns only verified claims (or a fixed "not found"), but the voice model still rephrases them
+  aloud and could add a sentence of its own. The post-hoc citation audit flags that case; nothing
+  blocks it. Verified voice answers are also not yet scored by the answer-level evaluation.
+- **The verifier adds latency to every spoken answer.** In the text evaluation, drafting plus
+  checking takes about 2.1 s on top of about 2.0 s of retrieval. Time to first audio in the live app
+  with and without the verifier has not been measured on real sessions yet (`GROUNDED_VOICE=0`
+  turns it off for that comparison).
 - **Indexed text quality bounds answer quality.** Garbled Indic OCR and mislabeled image captions
   both produced wrong or missing answers in the evaluation.
 - **Telugu, Hindi and Bengali coverage is thin** in the benchmark (a handful of pages each).
@@ -280,13 +359,18 @@ GitHub Actions runs the same suite on every push (`.github/workflows/ci.yml`).
 
 ## Roadmap
 
-1. Put the grounded-answer verifier in the voice path (speech-in, retrieve, verified text answer,
-   speech-out) and measure the latency/faithfulness trade-off against the current speech-to-speech
-   path on the same questions.
+1. Measure the verifier's latency/faithfulness trade-off in the live voice path
+   (`GROUNDED_VOICE=1` vs `0`, both log per-turn metrics), and compare against a cascaded
+   transcription, grounded answer, speech-synthesis pipeline on the same spoken questions.
 2. Calibrate the judge against human labels and repeat every run to report confidence intervals.
-3. Hybrid keyword + dense retrieval and a combined Tesseract + vision index as measured ablations.
+3. A combined Tesseract + vision index as a measured ablation, and keyword weighting tuned so hybrid
+   search stops costing top-1 accuracy.
 4. A public, redistributable multilingual corpus so the benchmark can live in the repo.
-5. An answer panel with claim-to-quote highlights and a per-turn trace timeline.
+5. An answer panel with claim-to-quote highlights (the exact quote drawn on the page image) and evidence
+   cards showing claim, quote, section and page.
+6. Follow-up awareness (rewrite "and the second one?" from recent turns) and cross-reference following
+   ("see Section 12").
+7. A public document set so the section-aware index and list-completeness checks can be scored in the repo.
 
 ## Data, privacy and copyright
 
