@@ -1,4 +1,7 @@
 import asyncio
+import itertools
+from collections import Counter
+import re
 import sys
 import os
 import base64
@@ -29,6 +32,9 @@ import numpy as np
 # OpenAI clients (sync for embeddings/vision/rerank, async for realtime).
 from openai import OpenAI, AsyncOpenAI
 
+from doc_structure import DocumentLayout, SectionTracker, structured_page_chunks
+from lexical_search import cached_for, lexical_ranking
+
 # Import configuration loader / model IDs.
 try:
     from config import (
@@ -46,7 +52,7 @@ except ImportError:
 # --- RAG Constants ---
 RAG_TEXT_CHUNK_SIZE = 800
 RAG_CHUNK_OVERLAP = 150
-INDEX_PIPELINE_VERSION = 2
+INDEX_PIPELINE_VERSION = 3  # 3: section-aware chunks, table rows, header cleanup, contextual embeddings
 OCR_MIN_TEXT_CHARS = 40
 RAG_TOP_K = 5
 RAG_CANDIDATE_K = 20
@@ -460,6 +466,13 @@ def build_or_load_index(
     embeddings_list = []
     metadata_list = []
     embedding_dimension = None
+    sequence = itertools.count()  # reading order of chunks within this document
+    tracker = SectionTracker()
+    try:
+        layout = DocumentLayout(fitz.open(pdf_path_str))
+    except Exception as exc:  # noqa: BLE001 - structure is an enhancement; plain chunking still works
+        print(f"\nWarning: could not analyse layout ({exc}); using plain chunks.", file=sys.stderr)
+        layout = None
 
     def _add_item(embedding, meta):
         """Detect/verify dim, then append the embedding + metadata. Returns True if added."""
@@ -488,11 +501,27 @@ def build_or_load_index(
             # 1. Process Text
             page_text, text_type = extract_page_text(page, ocr_mode, ocr_languages, client)
             if page_text and not page_text.isspace():
-                page_chunks = [c for c in chunk_text(page_text) if c and not c.isspace()]
-                for chunk, embedding in zip(page_chunks, get_text_embeddings(client, page_chunks)):
+                section_chunks = None
+                if text_type == "text" and layout is not None:
+                    try:
+                        section_chunks = structured_page_chunks(page, layout, tracker)
+                    except Exception as exc:  # noqa: BLE001 - fall back to plain chunking for this page
+                        print(f"\nWarning: structure reading failed on page {page_id} ({exc}); using plain chunks.",
+                              file=sys.stderr)
+                if not section_chunks:
+                    section_chunks = [
+                        {"content": c, "section": tracker.path, "kind": "text"}
+                        for c in chunk_text(page_text) if c and not c.isspace()
+                    ]
+                # The embedding sees the section path too, so "objections" finds the Objection handling
+                # section even when a chunk never repeats the word. Quotes are checked against content only.
+                embed_inputs = [f"{c['section']}\n{c['content']}" if c["section"] else c["content"]
+                                for c in section_chunks]
+                for chunk, embedding in zip(section_chunks, get_text_embeddings(client, embed_inputs)):
                     _add_item(
                         embedding,
-                        {"doc": doc_basename, "page": page_id, "type": text_type, "content": chunk},
+                        {"doc": doc_basename, "page": page_id, "type": text_type, "content": chunk["content"],
+                         "section": chunk["section"], "seq": next(sequence), "kind": chunk["kind"]},
                     )
 
             # 2. Process Images
@@ -537,6 +566,7 @@ def build_or_load_index(
                             "page": page_id,
                             "type": "image",
                             "content": description,
+                            "section": tracker.path, "seq": next(sequence), "kind": "image",
                             "image_path": str(image_path),
                         },
                     )
@@ -720,21 +750,210 @@ def rrf_merge(rankings: list[list[int]], limit: int, k: int = RRF_K) -> list[int
     return sorted(scores, key=lambda i: (-scores[i], order.get(i, 10**9)))[:limit]
 
 
+_QUERY_STOPWORDS = {
+    "what", "when", "where", "which", "while", "that", "this", "these", "those", "with", "from", "about",
+    "does", "have", "tell", "show", "give", "need", "should", "would", "could", "your", "they", "them",
+    "there", "their", "into", "over", "also", "just", "like", "please", "explain", "document", "materials",
+}
+_ENUMERATION = re.compile(
+    r"\b(all|every|each|list|name|enumerate|what are|how many|steps|types|kinds|ways|examples|options|"
+    r"reasons|everything)\b", re.IGNORECASE)
+SECTION_EXPANSION_ROWS = 12  # most chunks pulled in to cover a whole section
+SECTION_EXPANSION_CHARS = 6000
+NEIGHBOR_EXPANSION = 3  # most neighbouring chunks added around the best hits
+
+
+def _stems(text: str) -> set[str]:
+    """Word stems (first six letters) so "objections" matches "Objection handling"."""
+    return {w[:6] for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 4 and w not in _QUERY_STOPWORDS}
+
+
+def _section_stems(metadata_db: pd.DataFrame) -> list[set[str]]:
+    def build() -> list[set[str]]:
+        column = metadata_db["section"].fillna("").astype(str).tolist() if "section" in metadata_db else []
+        return [_stems(path) for path in column]
+
+    return cached_for(metadata_db, "section_stems", build)
+
+
+def section_title_ranking(query: str, metadata_db: pd.DataFrame, limit: int = 12) -> list[int]:
+    """Chunks whose section path shares words with the question, best overlap first.
+
+    A question for "the objections" should reach the "Objection handling" section even when the dense
+    search ranks other pages higher. Words that match a large part of the document carry no signal.
+    """
+    wanted = _stems(query)
+    stems = _section_stems(metadata_db)
+    if not wanted or not stems:
+        return []
+    scored = [(-len(wanted & s), i) for i, s in enumerate(stems) if wanted & s]
+    if not scored or len(scored) > max(60, len(stems) // 4):
+        return []
+    scored.sort()
+    return [i for _, i in scored[:limit]]
+
+
+def _section_group(path: str) -> str:
+    """The section a chunk belongs to for listing questions: its parent when it is a leaf of three or more."""
+    parts = path.split(" \u203a ")
+    return " \u203a ".join(parts[:-1]) if len(parts) >= 3 else path
+
+
+def expand_context(
+    metadata_db: pd.DataFrame, selected: list[int], query: str, whole_section: bool | None = None,
+) -> list[int]:
+    """Extra chunk positions that make the answer complete: the whole section for list-style questions,
+    and the chunk before and after the best hits. Returns positions not already selected."""
+    if "seq" not in metadata_db or "section" not in metadata_db or not selected:
+        return []
+    docs = metadata_db["doc"].astype(str).tolist()
+    sections = metadata_db["section"].fillna("").astype(str).tolist()
+    seqs = metadata_db["seq"].tolist()
+    chosen, extra = set(selected), []
+
+    def add(position: int) -> None:
+        if position not in chosen:
+            chosen.add(position)
+            extra.append(position)
+
+    listing = bool(_ENUMERATION.search(query)) if whole_section is None else whole_section
+    if listing:
+        groups = [(docs[p], _section_group(sections[p])) for p in selected[:3] if sections[p]]
+        if groups:
+            doc, group = max(set(groups), key=groups.count)
+            members = [i for i in range(len(docs)) if docs[i] == doc and sections[i]
+                       and (sections[i] == group or sections[i].startswith(group + " \u203a "))]
+            members.sort(key=lambda i: seqs[i])
+            size = 0
+            for i in members[:SECTION_EXPANSION_ROWS]:
+                size += len(str(metadata_db["content"].iloc[i]))
+                if size > SECTION_EXPANSION_CHARS:
+                    break
+                add(i)
+    else:
+        by_key = {(docs[i], seqs[i]): i for i in range(len(docs)) if seqs[i] == seqs[i]}  # skips NaN
+        added = 0
+        for position in selected[:2]:
+            for step in (-1, 1):
+                neighbour = by_key.get((docs[position], seqs[position] + step))
+                if (neighbour is not None and sections[neighbour] == sections[position]
+                        and added < NEIGHBOR_EXPANSION and neighbour not in chosen):
+                    add(neighbour)
+                    added += 1
+    return extra
+
+
+# Words that point back at an earlier turn. Short messages are treated as follow-ups regardless.
+_FOLLOWUP_CUES = re.compile(
+    r"\b(it|its|he|she|his|her|they|them|their|the same|the other|the first|the second|the third|the last|"
+    r"the previous|earlier|what about|how about|and what|and how)\b", re.IGNORECASE)
+REWRITE_TIMEOUT_S = 4.0
+
+
+def looks_like_followup(question: str, history: list | None) -> bool:
+    """Cheap gate so the rewrite model is only called when the message cannot stand alone."""
+    if not history or not question.strip():
+        return False
+    words = question.split()
+    return len(words) <= 9 or bool(_FOLLOWUP_CUES.search(question))
+
+
+def rewrite_followup(client: OpenAI, question: str, history: list[tuple[str, str]]) -> str:
+    """Turn "and the second one?" into a standalone question using the last few turns.
+
+    Returns the original question on any failure or timeout, so retrieval is never worse off.
+    """
+    recent = "\n".join(f"Learner: {q[:300]}\nCompanion: {a[:300]}" for q, a in history[-3:])
+    try:
+        resp = client.with_options(max_retries=0, timeout=REWRITE_TIMEOUT_S).chat.completions.create(
+            model=RERANK_MODEL_ID,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": (
+                "Rewrite the learner's latest message as one standalone search question, using the recent "
+                "conversation to resolve references (it, he, that, the second one, and what about...). Keep names, "
+                "numbers and the language of the message. If it already stands alone, return it unchanged. "
+                'Reply as JSON: {"question": "..."}.\n\nConversation:\n' + recent + "\n\nLatest message: " + question
+            )}],
+        )
+        rewritten = json.loads(resp.choices[0].message.content or "{}").get("question")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\nWarning: follow-up rewrite failed ({type(exc).__name__}); using the question as asked.", file=sys.stderr)
+        return question
+    return rewritten.strip() if isinstance(rewritten, str) and rewritten.strip() else question
+
+
+def _passage(row, expanded: bool = False) -> dict:
+    """A retrieved chunk as the answer pipeline sees it, with where it sits in the document."""
+    section = row["section"] if "section" in row else ""
+    seq = row["seq"] if "seq" in row else None
+    return {
+        "doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"]), "content": str(row["content"]),
+        "section": section if isinstance(section, str) else "",
+        "seq": int(seq) if seq is not None and seq == seq else None,
+        "expanded": expanded,
+    }
+
+
+def _pages_label(pages: list[int], limit: int = 6) -> str:
+    unique = list(dict.fromkeys(pages))
+    shown = ", ".join(str(p) for p in unique[:limit])
+    return f"pages {shown}" + (f" and {len(unique) - limit} more" if len(unique) > limit else "")
+
+
 def retrieve_documents(
     query: str, faiss_index, metadata_db: pd.DataFrame, client: OpenAI, top_k: int,
-    expand: bool = True,
+    expand: bool = True, progress=None, covers_all: bool = False, question_hint: str = "",
+    history: list[tuple[str, str]] | None = None, hybrid: bool = True, rewrite: bool = True,
 ) -> RetrievalResult:
-    """Run the production retrieval path, retaining candidate ranks for evals."""
+    """Run the production retrieval path, retaining candidate ranks for evals.
+
+    ``covers_all`` (set by the voice model) or a list-style ``question_hint`` (what the learner actually said,
+    which a rewritten search query may have lost) pulls in the whole matching section.
+
+    ``history`` (recent (question, answer) turns) lets a follow-up such as "and the second one?" be rewritten
+    into a standalone question; ``hybrid`` adds BM25 keyword search to the fused rankings. Both can be switched
+    off to measure what each contributes.
+
+    ``progress`` is an optional callable that receives a short human-readable sentence at each real
+    stage (it may be called from a worker thread); a failing callback never affects retrieval.
+    """
+    def say(text: str) -> None:
+        if progress is not None:
+            try:
+                progress(text)
+            except Exception:  # noqa: BLE001 - reporting must never break retrieval
+                pass
+
     print("Status: Finding relevant document context using FAISS...")
     if faiss_index is None or metadata_db is None or metadata_db.empty:
         return RetrievalResult("No document context available.")
 
     try:
+        say(f"Searching {faiss_index.ntotal} passages for \u201c{query}\u201d")
         started = time.perf_counter()
         variants = expand_query(client, query) if expand else [query]
         expansion_seconds = time.perf_counter() - started
+        if len(variants) > 1:
+            say(f"Also searching the English phrasing: \u201c{variants[1]}\u201d")
 
         started = time.perf_counter()
+        # The model's search query is often a single keyword ("Slack"); the learner's full question carries the
+        # intent, so it is searched too and the rankings are fused like any other variant.
+        spoken = (question_hint or "").strip()
+        if len(spoken.split()) >= 3 and spoken.lower().rstrip("?.! ") != query.lower().rstrip("?.! "):
+            variants = variants + [spoken]
+            heard_variant = True
+        else:
+            heard_variant = False
+        rewritten = ""
+        if rewrite and looks_like_followup(spoken or query, history):
+            asked = spoken or query
+            rewritten = rewrite_followup(client, asked, history)
+            if rewritten.strip().lower().rstrip("?.! ") != asked.strip().lower().rstrip("?.! "):
+                say(f"Understanding this as: \u201c{rewritten}\u201d")
+                variants = variants + [rewritten]
+            else:
+                rewritten = ""
         vectors = get_text_embeddings(client, variants)
         if any(v is None for v in vectors[:1]):
             return RetrievalResult("Could not process query embedding.", error="embedding_failed")
@@ -761,20 +980,46 @@ def retrieve_documents(
                 ranking.append(int(idx))
                 best_score[int(idx)] = max(best_score.get(int(idx), -1.0), float(score))
             rankings.append(ranking)
+        title_ranking = section_title_ranking(" ".join(variants), metadata_db)
+        if title_ranking:
+            for idx in title_ranking:
+                best_score.setdefault(idx, 0.0)
+            rankings.append(title_ranking)
+            sections_hit = Counter(_section_group(str(metadata_db["section"].iloc[i])) for i in title_ranking)
+            say(f"Matched section: {sections_hit.most_common(1)[0][0].split(' \u203a ')[-1]}")
+        if hybrid:
+            exact = lexical_ranking(" ".join(variants), metadata_db, RAG_CANDIDATE_K)
+            if exact:
+                for idx in exact:
+                    best_score.setdefault(idx, 0.0)
+                rankings.append(exact)
+                say("Also matching exact words in the text")
         retrieved_indices = rrf_merge(rankings, RAG_CANDIDATE_K) if len(rankings) > 1 else rankings[0]
         if not retrieved_indices:
             print(" - No relevant items found in index (all results were invalid).")
             return RetrievalResult("No relevant context found in documents.")
 
         candidate_rows = metadata_db.iloc[retrieved_indices]
-        candidate_texts = [str(c) for c in candidate_rows["content"].tolist()]
+        say(f"Found {len(retrieved_indices)} candidate passages on "
+            f"{_pages_label([int(p) for p in candidate_rows['page'].tolist()])}")
+        candidate_sections = (candidate_rows["section"].fillna("").astype(str).tolist()
+                              if "section" in candidate_rows else [""] * len(candidate_rows))
+        # The reranker sees where each passage sits, so a section heading can lift its own content.
+        candidate_texts = [f"[{s}] {c}" if s else str(c)
+                           for s, c in zip(candidate_sections, candidate_rows["content"].astype(str).tolist())]
         candidates = [
             {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"]),
              "score": best_score[idx]}
             for (_, row), idx in zip(candidate_rows.iterrows(), retrieved_indices)
         ]
 
-        rerank_query = query if len(variants) == 1 else f"{variants[0]} (English: {variants[1]})"
+        say(f"Ranking the candidates to pick the best {top_k}")
+        if rewritten:
+            rerank_query = f"{rewritten} (search terms: {query})"
+        elif heard_variant:
+            rerank_query = f"{spoken} (search terms: {query})"
+        else:
+            rerank_query = query if len(variants) == 1 else f"{variants[0]} (English: {variants[1]})"
         print(f" - Reranking {len(candidate_texts)} candidates -> top {top_k}...")
         rerank_started = time.perf_counter()
         reranked = rerank_candidates(client, rerank_query, candidate_texts, top_k)
@@ -782,17 +1027,24 @@ def retrieve_documents(
         # Map reranked positions back to metadata rows.
         selected_positions = reranked[:top_k]
         selected_rows = candidate_rows.iloc[selected_positions]
+        selected_abs = [retrieved_indices[p] for p in selected_positions]
+        listing = covers_all or bool(_ENUMERATION.search(f"{query} {question_hint}"))
+        extra_abs = expand_context(metadata_db, selected_abs, query, whole_section=listing)
 
         print(f" - Top {len(selected_rows)} relevant items selected.")
+        say(f"Best matches: {_pages_label([int(p) for p in selected_rows['page'].tolist()])}")
         sources = [
             {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"])}
             for _, row in selected_rows.iterrows()
         ]
-        passages = [
-            {"doc": str(row["doc"]), "page": int(row["page"]), "type": str(row["type"]),
-             "content": str(row["content"])}
-            for _, row in selected_rows.iterrows()
-        ]
+        if extra_abs:
+            if listing:
+                group = _section_group(str(metadata_db["section"].iloc[selected_abs[0]]))
+                say(f"Pulling in the rest of \u201c{group.split(' \u203a ')[-1]}\u201d so nothing is missed")
+            else:
+                say(f"Adding {len(extra_abs)} neighbouring passage{'s' if len(extra_abs) != 1 else ''} for context")
+        passages = [_passage(row) for _, row in selected_rows.iterrows()]
+        passages += [_passage(metadata_db.iloc[i], expanded=True) for i in extra_abs]
         return RetrievalResult(
             context=_format_context(selected_rows), sources=sources, candidates=candidates,
             passages=passages, query_variants=variants,

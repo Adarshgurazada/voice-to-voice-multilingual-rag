@@ -23,9 +23,26 @@ def require_openai_key() -> str:
     return key
 
 
+# Voice answers go through the claim-verifying pipeline (grounded_answer.py) by default.
+# Set GROUNDED_VOICE=0 to hand raw passages to the voice model instead (used to measure
+# what the verifier costs in latency).
+GROUNDED_VOICE = os.getenv("GROUNDED_VOICE", "1").strip().lower() not in ("0", "false", "off", "no")
+
+# Live transcript preview: a second, streaming transcription session shows words while the learner is
+# still speaking. It is display-only (the accurate transcript from the main session still drives the
+# answer language and the search). Set LIVE_TRANSCRIPT_PREVIEW=0 to turn it off and avoid the extra
+# transcription cost of sending the microphone audio to a second session.
+LIVE_TRANSCRIPT_PREVIEW = os.getenv("LIVE_TRANSCRIPT_PREVIEW", "1").strip().lower() not in ("0", "false", "off", "no")
+LIVE_PREVIEW_MODEL_ID = os.getenv("LIVE_PREVIEW_MODEL_ID", "gpt-realtime-whisper")
+
+# Keyword (BM25) search fused with the embedding search, and rewriting of follow-up questions from recent turns.
+# Both are on by default; set HYBRID_SEARCH=0 or FOLLOWUP_REWRITE=0 to switch one off (see benchmarks/RESULTS.md).
+HYBRID_SEARCH = os.getenv("HYBRID_SEARCH", "1").strip().lower() not in ("0", "false", "off", "no")
+FOLLOWUP_REWRITE = os.getenv("FOLLOWUP_REWRITE", "1").strip().lower() not in ("0", "false", "off", "no")
+
 # --- Model Configuration (OpenAI) ---
 # Realtime voice-to-voice model (STT + LLM + TTS in one session).
-REALTIME_MODEL_ID = "gpt-realtime-mini"
+REALTIME_MODEL_ID = "gpt-realtime-2.1-mini"
 # Text embeddings (1536-dim).
 EMBEDDING_MODEL_ID = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
@@ -38,7 +55,7 @@ QUIZ_MODEL_ID = "gpt-5.4-mini"
 # Transcription model used for the realtime input transcription hint.
 TRANSCRIBE_MODEL_ID = "gpt-4o-mini-transcribe"
 # Model that writes grounded, claim-cited answers in the text pipeline.
-ANSWER_MODEL_ID = "gpt-5.4-mini"
+ANSWER_MODEL_ID = os.getenv("ANSWER_MODEL_ID", "gpt-5.4-mini")
 # Model that checks, before an answer is shown, that each quoted claim is really supported.
 SUPPORT_MODEL_ID = "gpt-5.4-mini"
 # Stronger, different model used only to judge answers during evaluation (independent of the

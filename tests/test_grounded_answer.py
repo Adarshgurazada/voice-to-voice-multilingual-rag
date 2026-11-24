@@ -26,10 +26,13 @@ def _client(draft):
     return SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
 
 
-def _draft(claims, answerable=True, answer=None):
+def _draft(claims, answerable=True, answer=None, plain_words="", roles=None):
     text = answer if answer is not None else " ".join(c[0] for c in claims)
     return ga.GroundedDraft(answerable=answerable, answer=text,
-                            claims=[ga.AnswerClaim(text=t, source_id=s, quote=q) for t, s, q in claims])
+                            plain_words=plain_words,
+                            claims=[ga.AnswerClaim(text=t, source_id=s, quote=q,
+                                                   role=(roles[i] if roles else "answer"))
+                                    for i, (t, s, q) in enumerate(claims)])
 
 
 def test_detect_language_by_script():
@@ -134,3 +137,101 @@ def test_semantic_check_failure_fails_closed():
     client = SimpleNamespace(chat=SimpleNamespace(completions=Boom()))
     result = ga.answer_question(client, "Who led the Thirty?", PASSAGES)
     assert result.abstained and result.dropped[0]["reason"] == "not_supported"
+
+
+def test_claim_citing_document_name_is_repaired_when_quote_is_in_one_passage():
+    passage_text = PASSAGES[0]["content"]
+    quote = passage_text[:40]
+    draft = _draft([("A fact.", "some_document_name", quote)])
+    verified, dropped = ga.verify_draft(draft, PASSAGES)
+    assert [c["source_id"] for c in verified] == [PASSAGES[0]["id"]] and not dropped
+
+
+def test_misnamed_source_is_still_dropped_when_quote_matches_nothing():
+    verified, dropped = ga.verify_draft(_draft([("A fact.", "doc_name", "nothing like this anywhere")]), PASSAGES)
+    assert not verified and dropped[0]["reason"] == "unknown_source"
+
+
+def test_answer_question_reports_each_real_stage():
+    from types import SimpleNamespace
+    draft = _draft([("Critias led the junta.", "S1", "Critias son of Callaeschrus")])
+
+    class Completions:
+        def parse(self, **kwargs):
+            parsed = draft if kwargs["response_format"] is ga.GroundedDraft else ga.SupportCheck(
+                verdicts=[ga.SupportVerdict(index=0, supported=True)])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    steps = []
+    ga.answer_question(client, "Who led the junta?", PASSAGES, "en", True, steps.append)
+    assert steps == [
+        f"Reading {len(PASSAGES)} passages and drafting an answer",
+        "Checking 1 claim against the exact quotes",
+        "1 of 1 quotes found on the page",
+        "Confirming each claim is really supported by its passage",
+    ]
+
+
+def test_a_failing_progress_callback_never_breaks_answering():
+    from types import SimpleNamespace
+    draft = _draft([("Critias led the junta.", "S1", "Critias son of Callaeschrus")])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        parse=lambda **k: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=draft))]))))
+
+    def boom(text):
+        raise RuntimeError("socket gone")
+
+    assert ga.answer_question(client, "Who led?", PASSAGES, "en", False, boom).abstained is False
+
+
+def _teaching_client(draft, support_ok=True, explanation_ok=True):
+    from types import SimpleNamespace
+
+    class Completions:
+        def parse(self, **kwargs):
+            fmt = kwargs["response_format"]
+            if fmt is ga.GroundedDraft:
+                parsed = draft
+            elif fmt is ga.ExplanationVerdict:
+                parsed = ga.ExplanationVerdict(ok=explanation_ok)
+            else:
+                parsed = ga.SupportCheck(verdicts=[ga.SupportVerdict(index=i, supported=support_ok) for i in range(5)])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+
+def test_claims_keep_their_roles_and_sections_for_teaching():
+    passages = [{**PASSAGES[0], "section": "Part A › Section 1 · Start"}, *PASSAGES[1:]]
+    draft = _draft([("Critias led the junta.", "S1", "Critias son of Callaeschrus")], roles=["answer"])
+    answer = ga.answer_question(_teaching_client(draft), "Who led?", passages, "en", True)
+    assert answer.claims[0]["role"] == "answer"
+    assert answer.sections == ["Part A › Section 1 · Start"]
+
+
+def test_plain_words_survive_only_when_the_checker_agrees():
+    draft = _draft([("Critias led the junta.", "S1", "Critias son of Callaeschrus")],
+                   plain_words="In short, Critias was the leader.")
+    kept = ga.answer_question(_teaching_client(draft, explanation_ok=True), "Who led?", PASSAGES, "en", True)
+    assert kept.explanation == "In short, Critias was the leader." and not kept.abstained
+    dropped = ga.answer_question(_teaching_client(draft, explanation_ok=False), "Who led?", PASSAGES, "en", True)
+    assert dropped.explanation == "" and not dropped.abstained  # the verified claims are still spoken
+
+
+def test_plain_words_are_discarded_when_a_claim_they_describe_is_unsupported():
+    draft = _draft([("Critias led the junta.", "S1", "Critias son of Callaeschrus")],
+                   plain_words="In short, Critias was the leader.")
+    answer = ga.answer_question(_teaching_client(draft, support_ok=False), "Who led?", PASSAGES, "en", True)
+    assert answer.abstained and answer.explanation == ""
+
+
+def test_explanation_check_fails_closed_on_error():
+    from types import SimpleNamespace
+
+    def boom(**kwargs):
+        raise RuntimeError("api down")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=boom)))
+    assert ga.check_explanation(client, "anything", [{"text": "A claim."}]) is False
+    assert ga.check_explanation(client, "", [{"text": "A claim."}]) is False
